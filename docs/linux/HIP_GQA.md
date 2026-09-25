@@ -6,13 +6,12 @@ The local session initially held only the CPU baseline. The existing HIP branch
 was fetched and its incremental changes applied after verifying it preserved
 all local CPU changes. The HIP foundation was recovered, not reimplemented.
 
-Status: **Q/K/V is target-validated on the RX 6950 XT; Wo is implemented and
-requires target validation.** The validated Q/K/V milestone completed 36
-projection calls with max absolute differences 0.001953125 (Q+gate),
-0.001617432 (K), and 0.001464844 (V). The three-position Q/K/V hybrid fixture
-had zero logit difference. This environment still has no local `hipcc` or AMD
-device, so the newly added Wo path is not claimed PASS until target output is
-returned.
+Status: **GQA Q/K/V/Wo is target-validated on the RX 6950 XT / gfx1030.**
+The original Q/K/V fixture still passes unchanged. The new Wo fixture passed
+four-matrix residency, repeated execution, multi-layer ownership, replacement,
+scratch growth/reuse, injected allocation failure at Wq/Wk/Wv/Wo, injected Wo
+copy failure, rollback, shutdown and exact tracked-VRAM checks. The three-position
+hybrid fixture also passed with CPU attention and HIP Q/K/V/Wo.
 
 ## Data flow and geometry
 
@@ -21,7 +20,8 @@ HIP Wo → existing residual path. Q/K/V and Wo reuse the same validated simple
 wave32 Q8 kernel and compute stream; attention itself remains on CPU.
 
 QK normalization, RoPE, KV cache append, score computation, softmax, value
-accumulation, sigmoid gating, and output projection remain on CPU for HIP.
+accumulation and sigmoid gating remain on CPU. The final Wo output projection is
+now HIP Q8_0 when `WINMOE_GQA_HIP=1`.
 The full-inference capability remains false; DeltaNet and experts cannot enter
 unimplemented GPU paths. A separate Q/K/V capability controls this boundary.
 
@@ -60,16 +60,17 @@ The implementation does not assume a particular hidden width or head dimension.
 
 Re-upload allocates/copies an entire replacement before freeing old weights.
 OOM drains already-enqueued copies and frees only the replacement; old weights
-remain usable. A test hook simulates failure at each of the three allocations.
+remain usable. Test hooks simulate failure at each of the four allocations and a pre-enqueue
+copy failure at Wo.
 A copy/launch/runtime failure drains the stream and disables further GQA work
 until shutdown. Failure to drain or free is fatal rather than discarding memory
 ownership or returning host buffers with outstanding work. Inference treats
 GPU upload/projection failure as fatal and never consumes stale outputs.
 
-One growable scratch allocation holds FP32 input plus Q/K/V outputs. A matching
-host staging allocation is reused. The input is copied once per call, all work
-uses the existing compute stream, and output publication occurs only after all
-three results are ready. GQA calls are serialized on one host thread. Shutdown
+One growable scratch allocation is shared by Q/K/V and Wo. Q/K/V requires input
+plus three outputs; Wo requires attention input plus hidden output. A matching
+host staging allocation is reused. Each operation publishes host results only
+after the existing compute stream has synchronized successfully. GQA calls are serialized on one host thread. Shutdown
 frees every layer, scratch, staging, then streams. Device allocation accounting
 includes persistent matrices and scratch; it excludes runtime/driver overhead.
 
@@ -128,18 +129,19 @@ the separately fixed bound `0.001 + 0.00005 * abs(reference)`.
 | New fixture CPU self-check | PASS; max abs/RMSE 0 (CPU vs same CPU oracle, not GPU evidence) |
 | Required-device negative check | PASS; CPU executable cannot masquerade as HIP |
 | Host C++ syntax of Q8/GQA fixture sources | PASS; not a HIP backend compilation |
-| New HIP build | BLOCKED: hipcc unavailable |
-| Existing standalone Q8 regression on modified backend | NOT RUN here |
-| New Q+gate parity metrics | PENDING target output |
-| New K parity metrics | PENDING target output |
-| New V parity metrics | PENDING target output |
-| Hybrid inference / device lifetime tests | PENDING target execution |
+| HIP build on RX 6950 XT / gfx1030 | PASS |
+| Existing standalone Q8 regression on modified backend | PASS |
+| Q+gate parity | 36 calls; max abs 0.001953125; RMSE 0.000416676675 |
+| K parity | 36 calls; max abs 0.00161743164; RMSE 0.000359322842 |
+| V parity | 36 calls; max abs 0.00146484375; RMSE 0.000346418818 |
+| Wo parity | 30 calls; 15,456 outputs; max abs 0.0029296875; RMSE 0.000574647851; max rel 0.000655173437 |
+| Four-matrix lifecycle / rollback | PASS, including Wo allocation and Wo copy failure |
+| Representative four-matrix residency | 111,411,200 bytes = 106.25 MiB per GQA layer |
+| Hybrid inference | PASS; 3 positions; max logit abs diff 1.66893005e-06; RMSE 1.77150513e-07 |
 
-The prior baseline's target results remain recorded in `PORT_STATUS.md`:
-RX 6950 XT, gfx1030, wave32, 16,368 MiB, runtime 70253211; Q8 simple max abs
-9.765625e-4, RMSE 2.52418728e-4. Those are historical results, not a rerun of
-this change. No gfx1030 runtime issue was observed in this session because no
-AMD device is available. Device errors require the target log to diagnose.
+Target execution used the AMD Radeon RX 6950 XT / gfx1030, wave32, 16,368 MiB
+reported VRAM, HIP runtime 70253211. Existing Q8 and Q/K/V metrics remained
+within their established bounds, and no gfx1030 runtime issue was observed.
 
 ## Commands
 
@@ -216,14 +218,14 @@ The original zero-weight inference fixture's behavior remains unchanged.
 
 ## Remaining gates and next subsystem
 
-The new HIP translation unit must compile and all GPU-required tests must pass
-on gfx1030 before this milestone is complete. Full-model parity and performance
-are unmeasured. Wave64, multi-threaded host access and multi-GPU scheduling remain
+The GQA projection milestone is complete on gfx1030. Full-model parity and
+performance remain unmeasured. Wave64, multi-threaded host access and multi-GPU scheduling remain
 unsupported. No full GPU inference is advertised.
 
 The DeltaNet mapping disagreement remains deferred: CPU uses
 `h / DN_HEADS_PER_GROUP`, GPU-assisted host recurrence uses
 `h_idx % DN_NUM_KV_GROUPS`. Resolve it with a pinned reference and a multi-group
-regression before any HIP DeltaNet work. The current bounded subsystem is GQA Wo output projection using the same Q8
-helper. After Wo target acceptance, complete-GQA correctness is established and
-DeltaNet should remain deferred until its group-mapping discrepancy is resolved.
+regression before any HIP DeltaNet work. GQA Q/K/V/Wo correctness is now established for the synthetic fixtures. DeltaNet
+remains deferred until its group-mapping discrepancy is resolved. The next
+bounded accelerator work should establish independent Q4_K/Q5_K block parity
+before any expert-kernel/cache port.
