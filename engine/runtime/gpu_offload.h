@@ -19,6 +19,10 @@ extern "C" {
 int gpu_init(void);
 void gpu_shutdown(void);
 int gpu_is_initialized(void);
+/* Full inference requires every high-level operation below to be implemented.
+ * A backend may initialize successfully for diagnostics/kernel validation while
+ * deliberately advertising foundation-only capability. */
+int gpu_supports_full_inference(void);
 float gpu_vram_used_mb(void);
 
 /* Upload Q8_0 DeltaNet weights to GPU */

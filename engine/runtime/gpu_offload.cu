@@ -1209,4 +1209,7 @@ extern "C" void gpu_shutdown(void) {
 }
 
 extern "C" int gpu_is_initialized(void) { return g_initialized; }
+/* The inherited CUDA backend implements the complete high-level API expected by
+ * winmoe_inference.c; this capability distinguishes it from staged backends. */
+extern "C" int gpu_supports_full_inference(void) { return 1; }
 extern "C" float gpu_vram_used_mb(void) { return g_vram_used; }

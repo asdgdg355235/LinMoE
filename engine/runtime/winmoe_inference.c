@@ -815,8 +815,16 @@ int main(int argc, char** argv) {
             kv_cache_init(&kv_caches[i], MAX_SEQ, cfg.num_kv_heads, std_hd);
         }
     }
-    /* === GPU INITIALIZATION === */
-    int use_gpu = (gpu_init() == 0);
+    /* === GPU INITIALIZATION ===
+     * Initialization and full-inference capability are intentionally separate.
+     * The staged HIP backend can initialize and run isolated Q8 validation
+     * without making the unchecked legacy DeltaNet async path dereference
+     * unimplemented result buffers. */
+    int gpu_runtime_initialized = (gpu_init() == 0);
+    int use_gpu = gpu_runtime_initialized && gpu_supports_full_inference();
+    if (gpu_runtime_initialized && !use_gpu) {
+        fprintf(stderr, "GPU backend initialized in foundation-only mode; full inference remains on CPU\n");
+    }
     if (use_gpu) {
         /* Configure GPU expert cache limit (default 200, env-overridable) */
         const char* gpu_exp_env = getenv("WINMOE_GPU_EXPERTS");
@@ -916,7 +924,7 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "GPU GQA: %d layers uploaded, VRAM=%.0f MB\n", gqa_count, gpu_vram_used_mb());
         }
         /* Router stays on CPU — 480MB VRAM better spent on expert cache (v8.7, v9.5 confirmed) */
-    } else {
+    } else if (!gpu_runtime_initialized) {
         fprintf(stderr, "GPU init failed — running CPU-only\n");
     }
 
@@ -2304,7 +2312,9 @@ int main(int argc, char** argv) {
 
     /* All synchronous CPU reads/compute are complete. Drain the GPU before
      * releasing any host tensors that a backend could still reference. */
-    if (use_gpu) gpu_shutdown();
+    /* A foundation-only backend still owns runtime streams after successful
+     * initialization even though full inference deliberately stayed on CPU. */
+    if (gpu_is_initialized()) gpu_shutdown();
     for (i = 0; i < cfg.num_layers; i++) {
         kv_cache_free(&kv_caches[i]);
         dn_state_free(&dn_states[i]);
