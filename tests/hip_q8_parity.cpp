@@ -218,6 +218,7 @@ int main(void) {
     Metrics cross_single_simple;
     Metrics cross_single_optimized;
     int status = 0;
+    int completed_cases = 0;
 
     for (const Fixture& fixture : fixtures) {
         std::vector<unsigned char> weights;
@@ -250,13 +251,14 @@ int main(void) {
             update_metrics(cross_single_optimized, fixture.name, row,
                            gpu[2][row], gpu[0][row]);
         }
+        ++completed_cases;
     }
 
-    print_metrics("CPU vs HIP single", case_count, cpu_metrics[0]);
-    print_metrics("CPU vs HIP simple", case_count, cpu_metrics[1]);
-    print_metrics("CPU vs HIP optimized", case_count, cpu_metrics[2]);
-    print_metrics("HIP single vs simple", case_count, cross_single_simple);
-    print_metrics("HIP single vs optimized", case_count, cross_single_optimized);
+    print_metrics("CPU vs HIP single", completed_cases, cpu_metrics[0]);
+    print_metrics("CPU vs HIP simple", completed_cases, cpu_metrics[1]);
+    print_metrics("CPU vs HIP optimized", completed_cases, cpu_metrics[2]);
+    print_metrics("HIP single vs simple", completed_cases, cross_single_simple);
+    print_metrics("HIP single vs optimized", completed_cases, cross_single_optimized);
     printf("tolerance: abs<=%.3g + %.3g*|reference|; relative metric floor=%.1e\n",
            kAbsTol, kRelTol, kRelativeFloor);
 
