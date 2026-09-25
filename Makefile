@@ -94,11 +94,19 @@ check:
 endif
 
 ifeq ($(BACKEND),hip)
-$(BUILD)/hip-smoke-test: tests/hip_smoke_test.cpp $(BUILD)/gpu_offload_hip.o | $(BUILD)
-	$(HIPCC) $(CPPFLAGS) $(HIPFLAGS) -std=c++17 $(HIP_ARCH_FLAGS) $^ -o $@
+# hipcc adds HIP language mode when compiling a .cpp source. Compile each test
+# separately so that a following ELF .o is never reinterpreted as HIP source.
+$(BUILD)/hip-smoke-test.o: tests/hip_smoke_test.cpp $(RUNTIME)/gpu_offload.h $(RUNTIME)/gpu_offload_hip_test.h | $(BUILD) hip-toolchain-check
+	$(HIPCC) $(CPPFLAGS) $(HIPFLAGS) -std=c++17 $(HIP_ARCH_FLAGS) -c $< -o $@
 
-$(BUILD)/hip-q8-parity: tests/hip_q8_parity.cpp $(BUILD)/gpu_offload_hip.o | $(BUILD)
-	$(HIPCC) $(CPPFLAGS) $(HIPFLAGS) -std=c++17 $(HIP_ARCH_FLAGS) $^ -o $@
+$(BUILD)/hip-smoke-test: $(BUILD)/hip-smoke-test.o $(BUILD)/gpu_offload_hip.o
+	$(HIPCC) $(HIP_ARCH_FLAGS) $^ -o $@
+
+$(BUILD)/hip-q8-parity.o: tests/hip_q8_parity.cpp $(RUNTIME)/gpu_offload.h $(RUNTIME)/gpu_offload_hip_test.h | $(BUILD) hip-toolchain-check
+	$(HIPCC) $(CPPFLAGS) $(HIPFLAGS) -std=c++17 $(HIP_ARCH_FLAGS) -c $< -o $@
+
+$(BUILD)/hip-q8-parity: $(BUILD)/hip-q8-parity.o $(BUILD)/gpu_offload_hip.o
+	$(HIPCC) $(HIP_ARCH_FLAGS) $^ -o $@
 
 # GPU-required tests are separate so default 'make check' never depends on ROCm.
 hip-check: hip-toolchain-check $(BUILD)/hip-smoke-test $(BUILD)/hip-q8-parity
