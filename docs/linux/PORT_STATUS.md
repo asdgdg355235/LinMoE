@@ -3,7 +3,24 @@
 Base audited: `asdgdg355235/LinMoE`, `master`,
 `6aef92d7a947566b650b3231aa3169d71b26f15e`.
 Target direction: Arch Linux, RX 6950 XT / gfx1030, HIP, NVMe-streamed MoE.
-This change implements a **CPU foundation**, not the completed AMD port.
+The CPU and HIP/Q8 foundations are established. The GQA Q/K/V extension is
+implemented but awaits target compilation and GPU parity; this is not a completed
+AMD inference port.
+
+## GQA Q/K/V milestone — target validation pending
+
+Persistent Wq/Wk/Wv uploads, checked packed sizes, one shared input copy, shared
+Q8 kernel dispatch, synchronized host results, replacement/shutdown cleanup,
+and independent projection/inference fixtures are implemented. Attention and
+Wo stay on CPU. Hybrid inference is opt-in with `WINMOE_GQA_HIP=1`; the full
+inference gate remains closed. `hip-check` runs existing smoke/Q8 tests before
+new GQA and hybrid inference tests.
+
+The clean CPU suite and ASan/UBSan checks pass in this session. HIP compilation
+and new Q/K/V metrics remain unverified because this environment has no hipcc or
+AMD device. See [the exact implementation/validation handoff](HIP_GQA.md) for
+geometry, ownership, changed files, commands, results and blockers. Historical
+HIP foundation results below must not be interpreted as validation of this change.
 
 ## HIP foundation milestone
 
@@ -33,7 +50,7 @@ milestone. It does **not** claim full GPU inference.
   implementations. The tolerance is fixed in source at
   `abs_error <= 5e-2 + 5e-5 * abs(reference)`.
 - Runtime initialization is separated from full-inference capability. The HIP
-  backend reports foundation-only capability, so the existing unchecked
+  backend rejects full-inference capability and exposes Q/K/V separately, so the unchecked
   DeltaNet async path remains on CPU. CUDA advertises full capability. This is
   required because several DeltaNet launch/wait/result calls do not have safe
   per-operation fallback semantics.
@@ -225,9 +242,9 @@ allocation, storage, cache, and an expected output, **not general kernel parity*
 
 ## Next implementation order
 
-1. Reuse the validated Q8_0 primitive for GQA Q/K/V projection upload and
-   matvec offload, while retaining host attention and CPU fallback. Add
-   deterministic CPU-vs-HIP projection fixtures before enabling it in inference.
+1. Run the implemented GQA Q/K/V fixtures and hybrid inference on gfx1030;
+   record Q/K/V metrics and resource-lifetime results before enabling the
+   currently opt-in path by default. See `HIP_GQA.md`.
 2. Resolve the DeltaNet mapping discrepancy and establish nonzero multi-group
    CPU/reference fixtures before using either existing recurrence path as the
    oracle for HIP DeltaNet work.

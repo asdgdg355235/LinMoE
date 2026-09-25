@@ -23,6 +23,8 @@ int gpu_is_initialized(void);
  * A backend may initialize successfully for diagnostics/kernel validation while
  * deliberately advertising foundation-only capability. */
 int gpu_supports_full_inference(void);
+/* Narrow capability: Q/K/V only; does not enable DeltaNet, experts or Wo. */
+int gpu_supports_gqa_projections(void);
 float gpu_vram_used_mb(void);
 
 /* Upload Q8_0 DeltaNet weights to GPU */
@@ -56,7 +58,14 @@ float* gpu_get_qkv_out(int slot);
 float* gpu_get_gate_out(int slot);
 float* gpu_get_ssm_out_buf(int slot);
 
-/* GPU Standard Attention (GQA) */
+/* GPU Standard Attention (GQA).
+ * Legacy upload axis names follow GGUF: *_rows = input width (dims[0]),
+ * *_cols = output length (dims[1]). Each row of weights has input_width/32
+ * Q8_0 blocks of 34 bytes. Upload borrows host memory until return and retains
+ * device copies until replacement/shutdown. HIP ignores Wo; it stays on CPU.
+ * q_gate is interleaved [Q_h0, gate_h0, Q_h1, gate_h1, ...], each segment hd.
+ * Projections block until host outputs are ready. On nonzero return callers
+ * must not consume results. Calls are serialized by the single host thread. */
 int gpu_upload_gqa_weights(int layer,
     const void* wq_q8, int wq_rows, int wq_cols,
     const void* wk_q8, int wk_rows, int wk_cols,

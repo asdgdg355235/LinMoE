@@ -19,6 +19,10 @@ typedef enum {
  * every returned element and restoring tracked VRAM usage. */
 int gpu_hip_test_smoke(void);
 
+/* Simulate an allocation failure after count successful GQA weight allocations.
+ * A negative count disables injection. No actual device exhaustion is required. */
+void gpu_hip_test_gqa_fail_alloc_after(int count);
+
 /* Run one raw GGML Q8_0 matrix-vector multiplication. The matrix contains
  * out_dim rows, each with in_dim/32 packed 34-byte blocks. */
 int gpu_hip_test_q8_matvec(const void* weights, const float* input, float* output,

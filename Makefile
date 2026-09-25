@@ -24,7 +24,8 @@ COMMON_OBJS = $(BUILD)/winmoe_inference.o $(BUILD)/posix_io.o
 ifeq ($(BACKEND),cpu)
 GPU_OBJ = $(BUILD)/gpu_offload_cpu.o
 LINK = $(CC)
-LINK_FLAGS = -fopenmp
+# Preserve host sanitizer flags through the separate-object CPU link.
+LINK_FLAGS = $(CFLAGS) -fopenmp
 else ifeq ($(BACKEND),hip)
 GPU_OBJ = $(BUILD)/gpu_offload_hip.o
 LINK = $(HIPCC)
@@ -62,7 +63,7 @@ $(BUILD)/gpu_offload_hip.o: $(RUNTIME)/gpu_offload_hip.cpp $(RUNTIME)/gpu_offloa
 endif
 
 $(BUILD)/linmoe: $(COMMON_OBJS) $(GPU_OBJ)
-	$(LINK) $^ -o $@ $(LINK_FLAGS) -lm
+	$(LINK) $^ -o $@ $(LINK_FLAGS) $(LDFLAGS) -lm
 
 $(BUILD)/linmoe-inspect: tests/gguf_inspect.c $(HEADERS) | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 $< -o $@ -lm
@@ -102,16 +103,26 @@ $(BUILD)/hip-smoke-test.o: tests/hip_smoke_test.cpp $(RUNTIME)/gpu_offload.h $(R
 $(BUILD)/hip-smoke-test: $(BUILD)/hip-smoke-test.o $(BUILD)/gpu_offload_hip.o
 	$(HIPCC) $(HIP_ARCH_FLAGS) $^ -o $@
 
-$(BUILD)/hip-q8-parity.o: tests/hip_q8_parity.cpp $(RUNTIME)/gpu_offload.h $(RUNTIME)/gpu_offload_hip_test.h | $(BUILD) hip-toolchain-check
+$(BUILD)/hip-q8-parity.o: tests/hip_q8_parity.cpp tests/hip_q8_fixture.h $(RUNTIME)/gpu_offload.h $(RUNTIME)/gpu_offload_hip_test.h | $(BUILD) hip-toolchain-check
 	$(HIPCC) $(CPPFLAGS) $(HIPFLAGS) -std=c++17 $(HIP_ARCH_FLAGS) -c $< -o $@
 
 $(BUILD)/hip-q8-parity: $(BUILD)/hip-q8-parity.o $(BUILD)/gpu_offload_hip.o
 	$(HIPCC) $(HIP_ARCH_FLAGS) $^ -o $@
 
-# GPU-required tests are separate so default 'make check' never depends on ROCm.
-hip-check: hip-toolchain-check $(BUILD)/hip-smoke-test $(BUILD)/hip-q8-parity
+$(BUILD)/hip-gqa-parity.o: tests/hip_gqa_parity.cpp tests/hip_q8_fixture.h $(RUNTIME)/gpu_offload.h $(RUNTIME)/gpu_offload_hip_test.h | $(BUILD) hip-toolchain-check
+	$(HIPCC) $(CPPFLAGS) $(HIPFLAGS) -std=c++17 $(HIP_ARCH_FLAGS) -c $< -o $@
+
+$(BUILD)/hip-gqa-parity: $(BUILD)/hip-gqa-parity.o $(BUILD)/gpu_offload_hip.o
+	$(HIPCC) $(HIP_ARCH_FLAGS) $^ -o $@
+
+# Commands run in acceptance order: primitive, persistent projections, then the
+# opt-in inference boundary. A failing prerequisite prevents inference testing.
+hip-check: hip-toolchain-check $(BUILD)/hip-smoke-test $(BUILD)/hip-q8-parity $(BUILD)/hip-gqa-parity $(BUILD)/linmoe
 	$(BUILD)/hip-smoke-test
 	$(BUILD)/hip-q8-parity
+	$(BUILD)/hip-gqa-parity
+	python3 tests/hip_gqa_inference.py $(BUILD)/linmoe
+
 else
 hip-check:
 	@echo "LinMoE: hip-check requires BACKEND=hip." >&2

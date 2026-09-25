@@ -264,3 +264,6 @@ int gpu_expert_cache_count(void) {
 void gpu_set_expert_limit(int limit) {
     (void)limit;
 }
+
+/* Q/K/V capability is independent of the full legacy inference pipeline. */
+int gpu_supports_gqa_projections(void) { return 0; }

@@ -1213,3 +1213,6 @@ extern "C" int gpu_is_initialized(void) { return g_initialized; }
  * winmoe_inference.c; this capability distinguishes it from staged backends. */
 extern "C" int gpu_supports_full_inference(void) { return 1; }
 extern "C" float gpu_vram_used_mb(void) { return g_vram_used; }
+
+/* Q/K/V capability is independent of the full legacy inference pipeline. */
+extern "C" int gpu_supports_gqa_projections(void) { return 1; }

@@ -63,6 +63,25 @@ static const char* g_expert_trace_path = NULL;
  * Quality impact must be verified via Phase 1 parity gate before promoting. */
 static int g_moe_skip_every = 0;
 
+/* The normal CPU Q8 path quantizes activations to Q8_K. This opt-in scalar
+ * reference keeps FP32 activations, matching HIP's mathematical operation for
+ * inference parity diagnostics without changing the normal CPU fast path. */
+static void gqa_reference_matvec(float* out, const void* weights, const float* x,
+                                  int rows, int cols) {
+    const unsigned char* packed = (const unsigned char*)weights;
+    for (int r = 0; r < rows; ++r) {
+        double sum = 0;
+        for (int b = 0; b < cols / 32; ++b) {
+            const unsigned char* block = packed + ((size_t)r * (cols / 32) + b) * 34;
+            uint16_t bits = (uint16_t)block[0] | ((uint16_t)block[1] << 8);
+            double scale = fp16_to_fp32(bits);
+            for (int j = 0; j < 32; ++j)
+                sum += scale * (int8_t)block[2 + j] * x[b * 32 + j];
+        }
+        out[r] = (float)sum;
+    }
+}
+
 static void trace_dump(const char* name, int layer, int tok, const float* buf, int n) {
     if (!g_trace_out || tok != g_trace_tok || !buf || n <= 0) return;
     double sum = 0.0, sqsum = 0.0, mn = 1e30, mx = -1e30;
@@ -822,9 +841,23 @@ int main(int argc, char** argv) {
      * unimplemented result buffers. */
     int gpu_runtime_initialized = (gpu_init() == 0);
     int use_gpu = gpu_runtime_initialized && gpu_supports_full_inference();
-    if (gpu_runtime_initialized && !use_gpu) {
-        fprintf(stderr, "GPU backend initialized in foundation-only mode; full inference remains on CPU\n");
+    /* Until target GQA parity passes, hybrid inference is an explicit opt-in.
+     * Requiring it on a missing device/backend is an error, never a false PASS. */
+    int force_cpu_gqa = getenv("WINMOE_GQA_CPU") != NULL;
+    int request_hip_gqa = getenv("WINMOE_GQA_HIP") != NULL && !force_cpu_gqa;
+    int gqa_fp32_reference = getenv("WINMOE_GQA_FP32_REFERENCE") != NULL;
+    if (request_hip_gqa && (!gpu_runtime_initialized || !gpu_supports_gqa_projections())) {
+        fprintf(stderr, "LinMoE: requested GQA GPU projections unavailable\n");
+        if (gpu_is_initialized()) gpu_shutdown();
+        exit(EXIT_FAILURE);
     }
+    int use_gqa_gpu = gpu_runtime_initialized && gpu_supports_gqa_projections() &&
+                      (use_gpu || request_hip_gqa) && !force_cpu_gqa;
+    unsigned char* gqa_uploaded = (unsigned char*)calloc((size_t)cfg.num_layers, 1);
+    if (!gqa_uploaded) { gpu_shutdown(); exit(EXIT_FAILURE); }
+    if (gpu_runtime_initialized && !use_gpu)
+        fprintf(stderr, "Staged GPU backend: GQA Q/K/V=%s; attention, Wo, DeltaNet and experts stay on CPU\n",
+                use_gqa_gpu ? "enabled" : "disabled (opt in with WINMOE_GQA_HIP=1)");
     if (use_gpu) {
         /* Configure GPU expert cache limit (default 200, env-overridable) */
         const char* gpu_exp_env = getenv("WINMOE_GPU_EXPERTS");
@@ -902,30 +935,43 @@ int main(int argc, char** argv) {
         }
         fprintf(stderr, "GPU VRAM used: %.0f MB (DeltaNet)\n", gpu_vram_used_mb());
 
-        /* Upload standard GQA weights to GPU (Q8_0, ~840 MB for 15 layers) */
-        {
-            int gqa_count = 0;
-            for (i = 0; i < cfg.num_layers; i++) {
-                if (!layers[i].is_deltanet && layers[i].wq && layers[i].wk && layers[i].wv && layers[i].wo) {
-                    /* Q: [H, nqh*hd*2], K: [H, nkvh*hd], V: [H, nkvh*hd], O: [nqh*hd, H] */
-                    int std_nqh = 32, std_hd = 256;
-                    int q_cols = std_nqh * std_hd * 2;  /* 16384 */
-                    int kv_cols = cfg.num_kv_heads * std_hd; /* 512 */
-                    int o_rows = std_nqh * std_hd;  /* 8192 */
-                    if (gpu_upload_gqa_weights(i,
-                        layers[i].wq, H, q_cols,
-                        layers[i].wk, H, kv_cols,
-                        layers[i].wv, H, kv_cols,
-                        layers[i].wo, o_rows, H) == 0)
-                        gqa_count++;
-                }
-            }
-            if (gqa_count > 0)
-                fprintf(stderr, "GPU GQA: %d layers uploaded, VRAM=%.0f MB\n", gqa_count, gpu_vram_used_mb());
-        }
         /* Router stays on CPU — 480MB VRAM better spent on expert cache (v8.7, v9.5 confirmed) */
     } else if (!gpu_runtime_initialized) {
         fprintf(stderr, "GPU init failed — running CPU-only\n");
+    }
+
+    /* Upload once from actual GGUF geometry, outside the full-inference gate.
+     * The legacy CUDA caller hard-coded 32 query heads/256 channels, which
+     * over-read small synthetic models. Validate tensor storage before upload. */
+    if (use_gqa_gpu) {
+        int count = 0;
+        for (i = 0; i < cfg.num_layers; ++i) {
+            LayerWeights* lw = &layers[i];
+            if (lw->is_deltanet) continue;
+            const char* names[] = {"attn_q.weight", "attn_k.weight", "attn_v.weight"};
+            int outputs[] = {lw->wq_rows, lw->wk_rows, lw->wk_rows};
+            for (int m = 0; m < 3; ++m) {
+                char name[128];
+                snprintf(name, sizeof(name), "blk.%d.%s", i, names[m]);
+                TensorInfo* tensor = find_tensor(&model, name);
+                if (!tensor || tensor->n_dims != 2 || tensor->type != 8 || H % 32 ||
+                    tensor->dims[0] != (uint64_t)H || tensor->dims[1] != (uint64_t)outputs[m] ||
+                    tensor->data_size != (uint64_t)outputs[m] * (H / 32) * 34) {
+                    fprintf(stderr, "LinMoE: GQA GPU requires matching Q8_0 tensor %s input=%d output=%d\n",
+                            name, H, outputs[m]);
+                    gpu_shutdown(); exit(EXIT_FAILURE);
+                }
+            }
+            if (gpu_upload_gqa_weights(i, lw->wq, H, lw->wq_rows,
+                lw->wk, H, lw->wk_rows, lw->wv, H, lw->wk_rows,
+                lw->wo, lw->wq_rows / 2, H) != 0) {
+                fprintf(stderr, "LinMoE: GQA GPU upload failed layer=%d\n", i);
+                gpu_shutdown(); exit(EXIT_FAILURE);
+            }
+            gqa_uploaded[i] = 1;
+            ++count;
+        }
+        fprintf(stderr, "GPU GQA Q/K/V: %d layers uploaded, VRAM=%.6f MiB\n", count, gpu_vram_used_mb());
     }
 
     fprintf(stderr, "DeltaNet states: %d layers, KV caches: %d layers\n",
@@ -1049,13 +1095,23 @@ int main(int argc, char** argv) {
     int cur_token = prompt_tokens[0];
     int tokens_generated = 0;
 
-    /* Now that prompt_len is known, set the trace target to the last prompt position */
+    /* Default tracing stays at the last prompt. Tests may select any forward
+     * position to compare the growing CPU attention cache across backends. */
     if (g_trace_out) {
         g_trace_tok = prompt_len - 1;
-        fprintf(g_trace_out, "# winmoe trace: tok=%d (last prompt of %d-token prompt)\n",
-                g_trace_tok, prompt_len);
-        fprintf(stderr, "Trace target: tok=%d (last of %d prompt tokens)\n",
-                g_trace_tok, prompt_len);
+        const char* trace_tok = getenv("WINMOE_TRACE_TOK");
+        if (trace_tok) {
+            char* end = NULL;
+            long value = strtol(trace_tok, &end, 10);
+            if (end == trace_tok || *end || value < 0 || value >= num_tokens) {
+                fprintf(stderr, "LinMoE: invalid WINMOE_TRACE_TOK\n");
+                if (gpu_is_initialized()) gpu_shutdown();
+                exit(EXIT_FAILURE);
+            }
+            g_trace_tok = (int)value;
+        }
+        fprintf(g_trace_out, "# winmoe trace: tok=%d prompt_length=%d\n", g_trace_tok, prompt_len);
+        fprintf(stderr, "Trace target: tok=%d\n", g_trace_tok);
     }
 
     gen_start = lm_clock_now();
@@ -1465,13 +1521,19 @@ int main(int argc, char** argv) {
                 float* gate_buf_std = (float*)lm_temp_alloc(attn_dim * sizeof(float));
 
                 if (q_gate_buf && k_buf && v_buf && attn_buf && gate_buf_std) {
-                    /* 1. Q+Gate, K, V projections — GPU if available, else CPU */
-                    /* DIAG: force CPU path via env var to isolate GPU kernel issues */
-                    int force_cpu_gqa = getenv("WINMOE_GQA_CPU") != NULL;
-                    int gpu_proj = (use_gpu && !force_cpu_gqa) ? gpu_gqa_projections(layer, normed, H,
-                        q_gate_buf, q_out_dim, k_buf, kv_out_dim, v_buf, kv_out_dim) : -1;
-                    if (gpu_proj != 0) {
-                        /* CPU fallback */
+                    /* Only this projection boundary changes for HIP. Never hide a
+                     * failed device operation with stale outputs or CPU fallback. */
+                    if (gqa_uploaded[layer]) {
+                        if (gpu_gqa_projections(layer, normed, H, q_gate_buf, q_out_dim,
+                                                k_buf, kv_out_dim, v_buf, kv_out_dim) != 0) {
+                            fprintf(stderr, "LinMoE: GQA GPU projection failed layer=%d token=%d\n", layer, tok);
+                            gpu_shutdown(); exit(EXIT_FAILURE);
+                        }
+                    } else if (gqa_fp32_reference && lw->wq_type == 8 && lw->wk_type == 8 && lw->wv_type == 8) {
+                        gqa_reference_matvec(q_gate_buf, lw->wq, normed, q_out_dim, H);
+                        gqa_reference_matvec(k_buf, lw->wk, normed, kv_out_dim, H);
+                        gqa_reference_matvec(v_buf, lw->wv, normed, kv_out_dim, H);
+                    } else {
                         quant_matvec(q_gate_buf, lw->wq, normed, q_out_dim, H, lw->wq_type);
                         quant_matvec(k_buf, lw->wk, normed, kv_out_dim, H, lw->wk_type);
                         quant_matvec(v_buf, lw->wv, normed, kv_out_dim, H, lw->wv_type);
@@ -2333,6 +2395,7 @@ int main(int argc, char** argv) {
     for (i = 0; i < 16; ++i)
         for (int j = 0; j < 3; ++j) lm_aligned_free(io_pool[i][j]);
     free(embd_data); free(final_norm); free(lm_head);
+    free(gqa_uploaded);
     free(kv_caches);
     lm_aligned_free(hidden); lm_aligned_free(residual); lm_aligned_free(normed);
     lm_aligned_free(q); lm_aligned_free(k_cur); lm_aligned_free(v_cur);
