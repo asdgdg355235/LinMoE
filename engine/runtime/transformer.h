@@ -169,7 +169,7 @@ static void quant_matvec(float* out, const void* W, const float* x,
         case 8: /* Q8_0 */
             q8_matvec(out, W, x, out_dim, in_dim);
             break;
-        default:
+        case GGML_TYPE_F32:
             /* FP32 matmul with AVX-512 + OpenMP */
             {
                 const float* wf = (const float*)W;
@@ -190,5 +190,11 @@ static void quant_matvec(float* out, const void* W, const float* x,
                 }
             }
             break;
+        default:
+            /* Parser support does not imply a matvec implementation. Treating
+             * an unknown packed type as FP32 reads wrong values/out of bounds. */
+            fprintf(stderr, "LinMoE: unsupported matvec type=%d rows=%d cols=%d\n",
+                    type, out_dim, in_dim);
+            exit(EXIT_FAILURE);
     }
 }

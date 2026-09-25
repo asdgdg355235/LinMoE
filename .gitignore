@@ -24,3 +24,6 @@ engine/runtime/moe_out_L*.bin
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Native build outputs are reproducible, not source artifacts.
+/build/

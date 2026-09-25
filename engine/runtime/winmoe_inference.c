@@ -16,7 +16,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
-#include <windows.h>
+#include "../platform/runtime.h"
 #include <immintrin.h>
 #include <float.h>
 
@@ -125,123 +125,12 @@ static void trace_dump_scalar(const char* name, int layer, int tok, float v) {
 #define MAX_SEQ 512
 #define ALIGN 65536
 
-/*
- * Load a tensor's data from GGUF via explicit unbuffered I/O
- * Returns allocated buffer (caller must free)
- */
-/*
- * Read tensor data from GGUF via explicit I/O.
- * Returns a malloc'd buffer (caller can safely free()).
- * The read uses aligned I/O internally, then copies to a clean buffer.
- */
-static void* read_tensor_from_handle(HANDLE hFile, uint64_t data_start,
-                                     TensorInfo* tensor) {
-    uint64_t offset = data_start + tensor->offset;
-    uint64_t aligned = (offset / ALIGN) * ALIGN;
-    int sub = (int)(offset - aligned);
-    int read_size = (int)tensor->data_size + sub + ALIGN;
-    read_size = ((read_size + ALIGN - 1) / ALIGN) * ALIGN;
-
-    void* aligned_buf = _aligned_malloc(read_size, ALIGN);
-    if (!aligned_buf) return NULL;
-
-    LARGE_INTEGER li;
-    li.QuadPart = aligned;
-    SetFilePointerEx(hFile, li, NULL, FILE_BEGIN);
-    DWORD br;
-    ReadFile(hFile, aligned_buf, read_size, &br, NULL);
-
-    /* Copy tensor data to a regular malloc buffer (safely free-able) */
-    void* result = malloc((size_t)tensor->data_size);
-    if (result) {
-        memcpy(result, (char*)aligned_buf + sub, (size_t)tensor->data_size);
-    }
-    _aligned_free(aligned_buf);
-    return result;
-}
-
-/* Persistent shard file handles (opened once, used for all reads) */
-static HANDLE g_shard_handles[MAX_SHARDS] = {0};
-static int g_handles_open = 0;
-
-/* Separate handles: sync for weight loading, async for expert streaming */
-static HANDLE g_async_handles[MAX_SHARDS] = {0};
-
-static void open_shard_handles(GGUFModel* model) {
-    int i;
-    for (i = 0; i < model->num_shards; i++) {
-        /* Sync handle for weight loading */
-        g_shard_handles[i] = CreateFileA(model->shard_paths[i],
-            GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-            FILE_FLAG_NO_BUFFERING, NULL);
-        if (g_shard_handles[i] == INVALID_HANDLE_VALUE) {
-            g_shard_handles[i] = CreateFileA(model->shard_paths[i],
-                GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-        }
-        /* Async handle for overlapped expert reads */
-        g_async_handles[i] = CreateFileA(model->shard_paths[i],
-            GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-            FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, NULL);
-        if (g_async_handles[i] == INVALID_HANDLE_VALUE) {
-            g_async_handles[i] = g_shard_handles[i]; /* fallback to sync */
-        }
-    }
-    g_handles_open = 1;
-}
-
-/* Async read: issue non-blocking read, returns OVERLAPPED for later wait */
-typedef struct {
-    OVERLAPPED ov;
-    void* buf;          /* aligned read buffer */
-    int buf_size;
-    void* dest;         /* where to copy data */
-    int data_size;
-    int sub_offset;     /* offset within aligned buffer */
-    int valid;          /* 1 if async op was issued */
-} AsyncRead;
-
-static void async_read_start(AsyncRead* ar, int shard, uint64_t abs_offset,
-                              void* dest, int data_size, void* aligned_buf, int buf_size) {
-    uint64_t aligned = (abs_offset / ALIGN) * ALIGN;
-    ar->sub_offset = (int)(abs_offset - aligned);
-    ar->buf = aligned_buf;
-    ar->buf_size = buf_size;
-    ar->dest = dest;
-    ar->data_size = data_size;
-
-    memset(&ar->ov, 0, sizeof(OVERLAPPED));
-    ar->ov.Offset = (DWORD)(aligned & 0xFFFFFFFF);
-    ar->ov.OffsetHigh = (DWORD)(aligned >> 32);
-    ar->ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-
-    DWORD br;
-    BOOL ok = ReadFile(g_async_handles[shard], aligned_buf, buf_size, &br, &ar->ov);
-    ar->valid = 1;
-    /* ReadFile returns FALSE with ERROR_IO_PENDING for async — that's expected */
-}
-
-static void async_read_wait(AsyncRead* ar) {
-    if (!ar->valid) return;
-    WaitForSingleObject(ar->ov.hEvent, INFINITE);
-    /* Copy data from aligned buffer to destination */
-    if (ar->dest) {
-        memcpy(ar->dest, (char*)ar->buf + ar->sub_offset, ar->data_size);
-    }
-    CloseHandle(ar->ov.hEvent);
-    ar->valid = 0;
-}
-
-static void close_shard_handles(GGUFModel* model) {
-    int i;
-    for (i = 0; i < model->num_shards; i++) {
-        if (g_shard_handles[i] && g_shard_handles[i] != INVALID_HANDLE_VALUE)
-            CloseHandle(g_shard_handles[i]);
-        if (g_async_handles[i] && g_async_handles[i] != INVALID_HANDLE_VALUE
-            && g_async_handles[i] != g_shard_handles[i])
-            CloseHandle(g_async_handles[i]);
-    }
-    g_handles_open = 0;
-}
+/* Keep OS storage semantics outside inference scheduling. */
+#ifdef _WIN32
+#include "runtime_io_win32.h"
+#else
+#include "runtime_io_posix.h"
+#endif
 
 /* Undo GGUF +1 norm weight convention: stored as (weight + 1), subtract 1 */
 static void undo_norm_plus1(float* w, int n) {
@@ -254,23 +143,6 @@ static void* load_tensor_data(GGUFModel* model, TensorInfo* tensor, int* out_siz
     *out_size = (int)tensor->data_size;
     return read_tensor_from_handle(g_shard_handles[shard],
                                    model->shard_data_starts[shard], tensor);
-}
-
-/* Read raw bytes from a shard at an absolute offset (for expert reads) */
-static int read_bytes_from_shard(int shard, uint64_t abs_offset, void* dest,
-                                  int size, void* aligned_buf, int aligned_buf_size) {
-    uint64_t aligned = (abs_offset / ALIGN) * ALIGN;
-    int sub = (int)(abs_offset - aligned);
-
-    LARGE_INTEGER li;
-    li.QuadPart = aligned;
-    SetFilePointerEx(g_shard_handles[shard], li, NULL, FILE_BEGIN);
-    DWORD br;
-    ReadFile(g_shard_handles[shard], aligned_buf, aligned_buf_size, &br, NULL);
-
-    /* Copy just the needed bytes */
-    if (dest) memcpy(dest, (char*)aligned_buf + sub, size);
-    return (int)br;
 }
 
 /*
@@ -419,7 +291,9 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
                     layers[l].wq_rows = (int)t->dims[1];
                     if (l == 3) /* first standard layer */
                         fprintf(stderr, "Std attn L%d: Q dims=[%llu,%llu] type=%d size=%llu\n",
-                            l, t->dims[0], t->dims[1], t->type, t->data_size);
+                            /* uint64_t is unsigned long on Linux, unlike Win64. */
+                            l, (unsigned long long)t->dims[0], (unsigned long long)t->dims[1],
+                            t->type, (unsigned long long)t->data_size);
                 }
 
                 snprintf(name, 256, "blk.%d.attn_k.weight", l);
@@ -526,19 +400,44 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
 }
 
 int main(int argc, char** argv) {
-    const char* gguf_path = "D:/models/qwen35-35b-q4/Qwen3.5-35B-A3B-Q4_K_M.gguf";
+    /* Require an explicit model; no machine-specific Windows default. */
+    const char* gguf_path = NULL;
     int num_tokens = 10;
     const char* prompt_tokens_arg = NULL;  /* comma-separated token IDs (overrides default "Hello" prompt) */
 
-    /* Parse args */
+    /* Reject unknown/missing arguments before opening files or allocating weights.
+     * --tokens counts total forward positions, matching the inherited engine. */
     int i;
     for (i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--model") == 0 && i+1 < argc) gguf_path = argv[++i];
-        if (strcmp(argv[i], "--tokens") == 0 && i+1 < argc) num_tokens = atoi(argv[++i]);
-        if (strcmp(argv[i], "--prompt-tokens") == 0 && i+1 < argc) prompt_tokens_arg = argv[++i];
+        if (!strcmp(argv[i], "--help")) {
+            printf("Usage: linmoe --model FILE.gguf [--tokens 1..512] [--prompt-tokens ID,ID,...]\n"
+                   "CPU baseline requires AVX512F/BW/DQ/VL, AVX2, FMA and F16C.\n"
+                   "--tokens is total forward positions, including the prompt.\n");
+            return 0;
+        }
+        if (!strcmp(argv[i], "--model") && i + 1 < argc) gguf_path = argv[++i];
+        else if (!strcmp(argv[i], "--tokens") && i + 1 < argc) {
+            char* end;
+            errno = 0;
+            long n = strtol(argv[++i], &end, 10);
+            if (errno || !*argv[i] || *end || n < 1 || n > MAX_SEQ) {
+                fprintf(stderr, "LinMoE: --tokens must be 1..%d\n", MAX_SEQ);
+                return 2;
+            }
+            num_tokens = (int)n;
+        } else if (!strcmp(argv[i], "--prompt-tokens") && i + 1 < argc) {
+            prompt_tokens_arg = argv[++i];
+        } else {
+            fprintf(stderr, "LinMoE: unknown/incomplete argument: %s\n", argv[i]);
+            return 2;
+        }
+    }
+    if (!gguf_path || !*gguf_path) {
+        fprintf(stderr, "LinMoE: --model FILE.gguf is required (see --help)\n");
+        return 2;
     }
 
-    fprintf(stderr, "=== WinMoE Inference Engine v0.2 ===\n");
+    fprintf(stderr, "=== LinMoE Inference Engine ===\n");
     fprintf(stderr, "Model: %s\n", gguf_path);
 
     /* Layer-bisect trace output (for diff against llama-trace-dump). g_trace_tok
@@ -613,7 +512,7 @@ int main(int argc, char** argv) {
     }
 
     fflush(stderr);
-    printf("=== WinMoE Inference Engine v0.2 ===\n\n");
+    printf("=== LinMoE Inference Engine ===\n\n");
 
     /* Parse GGUF — heap-allocate because GGUFModel is >1MB (stack overflow on Windows) */
     GGUFModel* pmodel = (GGUFModel*)calloc(1, sizeof(GGUFModel));
@@ -627,6 +526,24 @@ int main(int argc, char** argv) {
     fprintf(stderr, "Parse done. Shards: %d, Tensors: %llu\n", model.num_shards, (unsigned long long)model.n_tensors);
     fflush(stderr);
     printf("Shards: %d, Total tensors: %llu\n", model.num_shards, (unsigned long long)model.n_tensors);
+
+    /* Existing expert arrays have 16 entries and Q5_K down activations have
+     * four 256-value blocks. Reject dimensions outside those implementation
+     * bounds before divisions, buffer sizing or kernel dispatch. */
+    if (model.hidden_dim <= 0 || model.hidden_dim > 8192 || model.hidden_dim % 256 ||
+        model.expert_intermediate <= 0 || model.expert_intermediate > 1024 || model.expert_intermediate % 256 ||
+        model.num_layers <= 0 || model.num_layers > 64 ||
+        model.num_experts <= 0 || model.num_experts > 1024 ||
+        model.expert_used_count <= 0 || model.expert_used_count > 16 ||
+        model.expert_used_count > model.num_experts || model.head_count_kv <= 0 ||
+        model.head_count_kv > 64 || model.ssm_state_size != 128 ||
+        model.ssm_inner_size <= 0 || model.ssm_inner_size > 8192 || model.ssm_inner_size % 128 ||
+        model.ssm_group_count <= 0 || model.ssm_group_count > 16 ||
+        (model.ssm_inner_size / 128) % model.ssm_group_count) {
+        fprintf(stderr, "LinMoE: model dimensions exceed the current Qwen3.5 runtime bounds\n");
+        free(pmodel);
+        return 1;
+    }
 
     ModelConfig cfg;
     cfg.hidden_dim = model.hidden_dim;
@@ -732,7 +649,11 @@ int main(int argc, char** argv) {
             if (!layers[i].is_deltanet && !layers[i].wq) { fprintf(stderr, "AUDIT: L%d (GQA) missing wq!\n", i); missing++; }
         }
         if (missing == 0) fprintf(stderr, "AUDIT: All %d layers have required weights.\n", cfg.num_layers);
-        else fprintf(stderr, "AUDIT: %d MISSING weights found!\n", missing);
+        else {
+            /* Inference cannot recover from a missing required layer weight. */
+            fprintf(stderr, "AUDIT: %d MISSING weights found!\n", missing);
+            exit(EXIT_FAILURE);
+        }
         /* Dump norm magnitudes for a few layers */
         int HD_AUDIT = cfg.hidden_dim;
         for (i = 0; i < cfg.num_layers; i += 10) {
@@ -771,6 +692,15 @@ int main(int argc, char** argv) {
     int sz;
 
     if (tok_embd) {
+        /* Only Q8_0 has an on-demand row decoder in this runtime. Reject
+         * other large/unsupported embeddings instead of generating zeros. */
+        if (tok_embd->n_dims != 2 || tok_embd->dims[0] != (uint64_t)cfg.hidden_dim ||
+            tok_embd->dims[1] > INT_MAX ||
+            (tok_embd->type != GGML_TYPE_F32 && tok_embd->type != GGML_TYPE_F16 && tok_embd->type != GGML_TYPE_Q8_0) ||
+            (tok_embd->data_size > 100000000ULL && tok_embd->type != GGML_TYPE_Q8_0)) {
+            fprintf(stderr, "LinMoE: unsupported embedding shape/type\n");
+            exit(EXIT_FAILURE);
+        }
         vocab_size = (int)tok_embd->dims[1];
         fprintf(stderr, "Embeddings: %llu x %llu, type=%d (%llu bytes)\n",
                 (unsigned long long)tok_embd->dims[0], (unsigned long long)tok_embd->dims[1],
@@ -797,6 +727,11 @@ int main(int argc, char** argv) {
         else fprintf(stderr, "WARNING: LM head failed to load\n");
     }
 
+    /* Missing output/embedding tensors cannot produce meaningful logits. */
+    if (!tok_embd || !final_norm || !lm_head || vocab_size <= 0) {
+        fprintf(stderr, "LinMoE: missing embedding, final norm, or output weights\n");
+        exit(EXIT_FAILURE);
+    }
     cfg.vocab_size = vocab_size;
 
     /* Allocate working buffers */
@@ -823,20 +758,36 @@ int main(int argc, char** argv) {
     fprintf(stderr, "MoE top_k = %d (GGUF says %d)\n", K, cfg.expert_k);
     int qkv_dim = cfg.num_q_heads * cfg.head_dim;
     int kv_dim = cfg.num_kv_heads * cfg.head_dim;
+    /* GQA reuses q but its head geometry is independent of DeltaNet's.
+     * Derive maxima from loaded projections; otherwise mixed architectures
+     * can overwrite q even when every tensor individually fits its file. */
+    for (i = 0; i < cfg.num_layers; ++i) {
+        if (!layers[i].is_deltanet) {
+            int qrows = layers[i].wq_rows, krows = layers[i].wk_rows;
+            if (krows <= 0 || krows > 16384 || krows % cfg.num_kv_heads ||
+                qrows <= 0 || qrows > 32768 || qrows % (2 * krows)) {
+                fprintf(stderr, "LinMoE: unsupported GQA projection geometry at layer %d\n", i);
+                exit(EXIT_FAILURE);
+            }
+            if (qrows / 2 > qkv_dim) qkv_dim = qrows / 2;
+            if (krows > kv_dim) kv_dim = krows;
+        }
+    }
 
-    float* hidden = (float*)_aligned_malloc(H * sizeof(float), 32);
-    float* residual = (float*)_aligned_malloc(H * sizeof(float), 32);
-    float* normed = (float*)_aligned_malloc(H * sizeof(float), 32);
-    float* q = (float*)_aligned_malloc(qkv_dim * sizeof(float), 32);
-    float* k_cur = (float*)_aligned_malloc(kv_dim * sizeof(float), 32);
-    float* v_cur = (float*)_aligned_malloc(kv_dim * sizeof(float), 32);
-    float* attn_out = (float*)_aligned_malloc(qkv_dim * sizeof(float), 32);
-    float* o_out = (float*)_aligned_malloc(H * sizeof(float), 32);
-    float* gate_buf = (float*)_aligned_malloc(I * sizeof(float), 32);
-    float* up_buf = (float*)_aligned_malloc(I * sizeof(float), 32);
-    float* act_buf = (float*)_aligned_malloc(I * sizeof(float), 32);
-    float* expert_out = (float*)_aligned_malloc(H * sizeof(float), 32);
-    float* moe_out = (float*)_aligned_malloc(H * sizeof(float), 32);
+
+    float* hidden = (float*)lm_aligned_alloc(H * sizeof(float), 32);
+    float* residual = (float*)lm_aligned_alloc(H * sizeof(float), 32);
+    float* normed = (float*)lm_aligned_alloc(H * sizeof(float), 32);
+    float* q = (float*)lm_aligned_alloc(qkv_dim * sizeof(float), 32);
+    float* k_cur = (float*)lm_aligned_alloc(kv_dim * sizeof(float), 32);
+    float* v_cur = (float*)lm_aligned_alloc(kv_dim * sizeof(float), 32);
+    float* attn_out = (float*)lm_aligned_alloc(qkv_dim * sizeof(float), 32);
+    float* o_out = (float*)lm_aligned_alloc(H * sizeof(float), 32);
+    float* gate_buf = (float*)lm_aligned_alloc(I * sizeof(float), 32);
+    float* up_buf = (float*)lm_aligned_alloc(I * sizeof(float), 32);
+    float* act_buf = (float*)lm_aligned_alloc(I * sizeof(float), 32);
+    float* expert_out = (float*)lm_aligned_alloc(H * sizeof(float), 32);
+    float* moe_out = (float*)lm_aligned_alloc(H * sizeof(float), 32);
     float* logits = (float*)malloc(vocab_size * sizeof(float));
 
     /* Expert weight read buffer */
@@ -850,7 +801,7 @@ int main(int argc, char** argv) {
         if (es > (uint64_t)max_expert_size) max_expert_size = (int)es;
     }
     int expert_buf_size = ((max_expert_size + ALIGN * 2) / ALIGN + 1) * ALIGN;
-    void* expert_buf = _aligned_malloc(expert_buf_size, ALIGN);
+    void* expert_buf = lm_aligned_alloc(expert_buf_size, ALIGN);
 
     /* DeltaNet states + KV caches per layer */
     DeltaNetState* dn_states = (DeltaNetState*)calloc(cfg.num_layers, sizeof(DeltaNetState));
@@ -986,6 +937,21 @@ int main(int argc, char** argv) {
             if (gb >= 1 && gb <= 32) cache_budget = gb * 1024LL * 1024 * 1024;
         }
     }
+    /* All cache slots use the same layout; reject heterogeneous experts
+     * rather than copying a later layer into a layer-zero-sized allocation. */
+    if (expert_total_size <= 0 || expert_total_size > cache_budget) {
+        fprintf(stderr, "LinMoE: invalid expert size/cache budget\n");
+        exit(EXIT_FAILURE);
+    }
+    for (i = 0; i < cfg.num_layers; ++i) {
+        if (!layers[i].gate_per_expert ||
+            layers[i].gate_per_expert != layers[0].gate_per_expert ||
+            layers[i].up_per_expert != layers[0].up_per_expert ||
+            layers[i].down_per_expert != layers[0].down_per_expert) {
+            fprintf(stderr, "LinMoE: incompatible expert layout at layer %d\n", i);
+            exit(EXIT_FAILURE);
+        }
+    }
     int max_cached = (int)(cache_budget / expert_total_size);
     if (max_cached > cfg.num_layers * cfg.num_experts) max_cached = cfg.num_layers * cfg.num_experts;
 
@@ -1017,9 +983,9 @@ int main(int argc, char** argv) {
     {
         int got_all = 1;
         for (int q = 0; q < 16; q++) {
-            io_pool[q][0] = _aligned_malloc(expert_buf_size, ALIGN);
-            io_pool[q][1] = _aligned_malloc(expert_buf_size, ALIGN);
-            io_pool[q][2] = _aligned_malloc(expert_buf_size, ALIGN);
+            io_pool[q][0] = lm_aligned_alloc(expert_buf_size, ALIGN);
+            io_pool[q][1] = lm_aligned_alloc(expert_buf_size, ALIGN);
+            io_pool[q][2] = lm_aligned_alloc(expert_buf_size, ALIGN);
             if (!io_pool[q][0] || !io_pool[q][1] || !io_pool[q][2]) got_all = 0;
         }
         fprintf(stderr, "IO buffer pool: %d slots × 3 × %d bytes = %.1f MB %s\n",
@@ -1028,13 +994,14 @@ int main(int argc, char** argv) {
     }
 
     /* === TOKEN GENERATION LOOP === */
-    LARGE_INTEGER freq, gen_start, gen_end;
-    QueryPerformanceFrequency(&freq);
+    /* Monotonic ticks exclude wall-clock adjustments from timings. */
+    int64_t freq, gen_start, gen_end;
+    freq = lm_clock_frequency();
 
     /* Profiling accumulators (per token, reset each token) */
     double prof_attn_ms, prof_expert_io_ms, prof_expert_compute_ms;
     double prof_router_ms, prof_norm_ms, prof_embed_ms;
-    LARGE_INTEGER prof_t0, prof_t1;
+    int64_t prof_t0, prof_t1;
 
     /* Default prompt (chat "Hello"): <|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n */
     int prompt_tokens_default[] = {248045, 846, 198, 9419, 248046, 198, 248045, 74455, 198};
@@ -1044,22 +1011,31 @@ int main(int argc, char** argv) {
     if (prompt_tokens_arg) {
         prompt_len = 0;
         const char* p = prompt_tokens_arg;
-        while (*p && prompt_len < 1024) {
+        /* Token IDs are indices, not arbitrary integers. Refuse truncation,
+         * trailing garbage and empty fields before accessing embeddings/logits. */
+        while (*p) {
             char* end = NULL;
+            errno = 0;
             long v = strtol(p, &end, 10);
-            if (end == p) break;
+            if (errno || end == p || v < 0 || v >= vocab_size ||
+                prompt_len >= MAX_SEQ || (*end && *end != ',') ||
+                (*end == ',' && !end[1])) {
+                fprintf(stderr, "LinMoE: invalid --prompt-tokens near %s\n", p);
+                exit(EXIT_FAILURE);
+            }
             prompt_tokens_buf[prompt_len++] = (int)v;
-            p = end;
-            if (*p == ',') p++;
+            p = *end ? end + 1 : end;
         }
-        if (prompt_len > 0) {
-            prompt_tokens = prompt_tokens_buf;
-            fprintf(stderr, "Custom prompt: %d tokens, first 10 ids: ", prompt_len);
-            for (int q = 0; q < prompt_len && q < 10; q++) fprintf(stderr, "%d ", prompt_tokens[q]);
-            fprintf(stderr, "\n");
-        } else {
-            fprintf(stderr, "WARN: --prompt-tokens parsed 0 ids, falling back to default\n");
-            prompt_tokens = prompt_tokens_default; prompt_len = 9;
+        if (!prompt_len) {
+            fprintf(stderr, "LinMoE: --prompt-tokens must not be empty\n");
+            exit(EXIT_FAILURE);
+        }
+        prompt_tokens = prompt_tokens_buf;
+    }
+    for (i = 0; i < prompt_len; ++i) {
+        if (prompt_tokens[i] < 0 || prompt_tokens[i] >= vocab_size) {
+            fprintf(stderr, "LinMoE: prompt token %d exceeds vocabulary %d\n", prompt_tokens[i], vocab_size);
+            exit(EXIT_FAILURE);
         }
     }
     int cur_token = prompt_tokens[0];
@@ -1074,11 +1050,11 @@ int main(int argc, char** argv) {
                 g_trace_tok, prompt_len);
     }
 
-    QueryPerformanceCounter(&gen_start);
+    gen_start = lm_clock_now();
 
     for (int tok = 0; tok < num_tokens; tok++) {
-        LARGE_INTEGER tok_start, tok_end;
-        QueryPerformanceCounter(&tok_start);
+        int64_t tok_start, tok_end;
+        tok_start = lm_clock_now();
         prof_attn_ms = prof_expert_io_ms = prof_expert_compute_ms = 0;
         prof_router_ms = prof_norm_ms = prof_embed_ms = 0;
 
@@ -1110,12 +1086,11 @@ int main(int argc, char** argv) {
             uint64_t embd_aligned = (embd_abs / ALIGN) * ALIGN;
             int embd_sub = (int)(embd_abs - embd_aligned);
             int embd_read_sz = ((row_bytes + embd_sub + ALIGN) / ALIGN) * ALIGN;
-            void* embd_buf = _aligned_malloc(embd_read_sz, ALIGN);
+            void* embd_buf = lm_aligned_alloc(embd_read_sz, ALIGN);
             if (embd_buf) {
-                LARGE_INTEGER eli; eli.QuadPart = embd_aligned;
-                SetFilePointerEx(g_shard_handles[tok_embd->shard], eli, NULL, FILE_BEGIN);
-                DWORD ebr;
-                ReadFile(g_shard_handles[tok_embd->shard], embd_buf, embd_read_sz, &ebr, NULL);
+                /* The storage boundary validates the row; no shared seek position. */
+                read_bytes_from_shard(tok_embd->shard, embd_abs, NULL,
+                                      row_bytes, embd_buf, embd_read_sz);
                 const unsigned char* raw = (const unsigned char*)embd_buf + embd_sub;
                 if (tok == 0) {
                     /* Dump first Q8_0 block: 2 bytes FP16 scale + 32 int8 values */
@@ -1138,7 +1113,7 @@ int main(int argc, char** argv) {
                         d_val * (float)(signed char)raw[2], d_val * (float)(signed char)raw[2]);
                 }
                 q8_dequant_row(hidden, raw, H);
-                _aligned_free(embd_buf);
+                lm_aligned_free(embd_buf);
             } else {
                 memset(hidden, 0, H * sizeof(float));
             }
@@ -1168,7 +1143,7 @@ int main(int argc, char** argv) {
             trace_dump("attn_norm",   layer, tok, normed, H);
 
             /* 2b-g. Attention — dispatch DeltaNet or standard GQA */
-            QueryPerformanceCounter(&prof_t0);
+            prof_t0 = lm_clock_now();
             memset(o_out, 0, H * sizeof(float));
 
             if (lw->is_deltanet) {
@@ -1298,8 +1273,8 @@ int main(int argc, char** argv) {
                     float* V_ptr = gpu_qkv + DN_KEY_DIM + DN_KEY_DIM;
 
                     /* Compute gate parameters */
-                    float* gate_decay = (float*)_malloca(DN_NUM_GATES * sizeof(float));
-                    float* beta_vals = (float*)_malloca(DN_NUM_GATES * sizeof(float));
+                    float* gate_decay = (float*)lm_temp_alloc(DN_NUM_GATES * sizeof(float));
+                    float* beta_vals = (float*)lm_temp_alloc(DN_NUM_GATES * sizeof(float));
                     int hi;
                     for (hi = 0; hi < DN_NUM_GATES; hi++) {
                         /* Stable softplus: log1p(exp(-|x|)) + max(x,0) avoids overflow at large x */
@@ -1307,7 +1282,7 @@ int main(int argc, char** argv) {
                             expf(lw->ssm_a[hi] * softplus_stable(alpha_raw[hi] + lw->ssm_dt_bias[hi])) : 0.99f;
                         if (a_val > 1.0f) a_val = 1.0f;
                         if (a_val < 0.0f) a_val = 0.0f;
-                        if (_isnan(a_val)) a_val = 0.99f;
+                        if (isnan(a_val)) a_val = 0.99f;
                         gate_decay[hi] = a_val;
                         beta_vals[hi] = sigmoid_stable(beta_raw[hi]);
                     }
@@ -1445,6 +1420,9 @@ int main(int argc, char** argv) {
                         fprintf(stderr, "=== END L0 VALIDATION ===\n");
                     }
 
+                    /* Recurrence temporaries are owned by this layer invocation. */
+                    free(gate_decay);
+                    free(beta_vals);
                 } else if (lw->w_qkv) {
                     /* === CPU FALLBACK: GATED DELTANET === */
                     deltanet_forward(
@@ -1472,11 +1450,11 @@ int main(int argc, char** argv) {
                 int attn_dim = nqh * hd;      /* 8192 */
 
                 /* Allocate temp buffers */
-                float* q_gate_buf = (float*)_malloca(q_out_dim * sizeof(float));
-                float* k_buf = (float*)_malloca(kv_out_dim * sizeof(float));
-                float* v_buf = (float*)_malloca(kv_out_dim * sizeof(float));
-                float* attn_buf = (float*)_malloca(attn_dim * sizeof(float));
-                float* gate_buf_std = (float*)_malloca(attn_dim * sizeof(float));
+                float* q_gate_buf = (float*)lm_temp_alloc(q_out_dim * sizeof(float));
+                float* k_buf = (float*)lm_temp_alloc(kv_out_dim * sizeof(float));
+                float* v_buf = (float*)lm_temp_alloc(kv_out_dim * sizeof(float));
+                float* attn_buf = (float*)lm_temp_alloc(attn_dim * sizeof(float));
+                float* gate_buf_std = (float*)lm_temp_alloc(attn_dim * sizeof(float));
 
                 if (q_gate_buf && k_buf && v_buf && attn_buf && gate_buf_std) {
                     /* 1. Q+Gate, K, V projections — GPU if available, else CPU */
@@ -1578,11 +1556,11 @@ int main(int argc, char** argv) {
                     {
                         /* Emit gate_sigmoid as a tensor too (only if tracing) */
                         if (g_trace_out && tok == g_trace_tok) {
-                            float* gs_buf = (float*)_malloca(attn_dim * sizeof(float));
+                            float* gs_buf = (float*)lm_temp_alloc(attn_dim * sizeof(float));
                             if (gs_buf) {
                                 for (i = 0; i < attn_dim; i++) gs_buf[i] = sigmoid_stable(gate_buf_std[i]);
                                 trace_dump("gate_sigmoid", layer, tok, gs_buf, attn_dim);
-                                _freea(gs_buf);
+                                free(gs_buf);
                             }
                         }
                     }
@@ -1631,11 +1609,11 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                if (q_gate_buf) _freea(q_gate_buf);
-                if (k_buf) _freea(k_buf);
-                if (v_buf) _freea(v_buf);
-                if (attn_buf) _freea(attn_buf);
-                if (gate_buf_std) _freea(gate_buf_std);
+                if (q_gate_buf) free(q_gate_buf);
+                if (k_buf) free(k_buf);
+                if (v_buf) free(v_buf);
+                if (attn_buf) free(attn_buf);
+                if (gate_buf_std) free(gate_buf_std);
             } else {
                 /* Standard attention layer but weights not loaded — zero output */
             }
@@ -1653,8 +1631,8 @@ int main(int argc, char** argv) {
             for (i = 0; i < H; i++) hidden[i] = residual[i] + o_out[i];
             memcpy(residual, hidden, H * sizeof(float));
             trace_dump("attn_residual", layer, tok, hidden, H);
-            QueryPerformanceCounter(&prof_t1);
-            prof_attn_ms += (double)(prof_t1.QuadPart - prof_t0.QuadPart) / freq.QuadPart * 1000.0;
+            prof_t1 = lm_clock_now();
+            prof_attn_ms += (double)(prof_t1 - prof_t0) / freq * 1000.0;
 
             /* Post-attention norm (before MoE) */
             if (lw->post_attn_norm) {
@@ -1682,9 +1660,10 @@ int main(int argc, char** argv) {
             /* (post_attn_norm already applied above, normed is ready for MoE) */
 
             /* 2i. Router — find top-K experts */
-            QueryPerformanceCounter(&prof_t0);
-            int expert_ids[16];
-            float expert_weights[16];
+            prof_t0 = lm_clock_now();
+            /* Unused entries stay defined for inherited top-three diagnostics. */
+            int expert_ids[16] = {0};
+            float expert_weights[16] = {0};
             if (lw->gate_inp) {
                 router_topk(normed, lw->gate_inp, lw->gate_type,
                            H, cfg.num_experts, K, expert_ids, expert_weights);
@@ -1693,12 +1672,12 @@ int main(int argc, char** argv) {
                 for (i = 0; i < K; i++) { expert_ids[i] = i; expert_weights[i] = 1.0f / K; }
             }
 
-            QueryPerformanceCounter(&prof_t1);
-            prof_router_ms += (double)(prof_t1.QuadPart - prof_t0.QuadPart) / freq.QuadPart * 1000.0;
+            prof_t1 = lm_clock_now();
+            prof_router_ms += (double)(prof_t1 - prof_t0) / freq * 1000.0;
 
             /* Pre-quantize normed activation to Q8_K once for all experts */
             int q8k_blocks = H / Q8K_QK;
-            block_q8_K* normed_q8k = (block_q8_K*)_malloca(q8k_blocks * sizeof(block_q8_K));
+            block_q8_K* normed_q8k = (block_q8_K*)lm_temp_alloc(q8k_blocks * sizeof(block_q8_K));
             if (normed_q8k) quantize_row_q8_K(normed_q8k, normed, H);
 
             /* T27: Dump first expert's FFN output for layer 0 tok 0 */
@@ -1723,7 +1702,7 @@ int main(int argc, char** argv) {
             int skip_routed_moe = (g_moe_skip_every >= 2 &&
                                    (layer % g_moe_skip_every) == (g_moe_skip_every - 1));
             if (skip_routed_moe) {
-                if (normed_q8k) _freea(normed_q8k);
+                if (normed_q8k) free(normed_q8k);
                 goto skip_routed_moe_label;
             }
 
@@ -1792,7 +1771,7 @@ int main(int argc, char** argv) {
                 int eid = expert_ids[ek];
 
                 /* === Expert I/O + Compute with cache === */
-                QueryPerformanceCounter(&prof_t0);
+                prof_t0 = lm_clock_now();
 
                 int cache_key = layer * cfg.num_experts + eid;
 
@@ -1802,8 +1781,8 @@ int main(int argc, char** argv) {
                     /* GPU EXPERT HIT — fully fused: gate+up+swiglu+down all on GPU */
                     gpu_expert_ffn_fused(gpu_idx, normed, H, I, expert_out);
 
-                    QueryPerformanceCounter(&prof_t1);
-                    prof_expert_io_ms += (double)(prof_t1.QuadPart - prof_t0.QuadPart) / freq.QuadPart * 1000.0;
+                    prof_t1 = lm_clock_now();
+                    prof_expert_io_ms += (double)(prof_t1 - prof_t0) / freq * 1000.0;
 
                     /* Accumulate */
                     __m256 vw = _mm256_set1_ps(expert_weights[ek]);
@@ -1897,9 +1876,9 @@ int main(int argc, char** argv) {
                             }
                         }
                     } else {
-                        /* malloc/issue failed — zero output for this expert */
-                        if (pending[ek].slot) free(pending[ek].slot);
-                        gate_data = up_data = down_data = expert_buf;
+                        /* A missing read is fatal: the scratch buffer is not weights. */
+                        fprintf(stderr, "LinMoE: expert allocation/read failed layer=%d expert=%d\n", layer, eid);
+                        exit(EXIT_FAILURE);
                     }
                     cache_misses++;
                 }
@@ -1965,8 +1944,8 @@ int main(int argc, char** argv) {
                     quant_matvec(expert_out, down_data, act_buf, H, I, lw->down_exps_type);
                 }
 
-                QueryPerformanceCounter(&prof_t1);
-                prof_expert_io_ms += (double)(prof_t1.QuadPart - prof_t0.QuadPart) / freq.QuadPart * 1000.0;
+                prof_t1 = lm_clock_now();
+                prof_expert_io_ms += (double)(prof_t1 - prof_t0) / freq * 1000.0;
 
                 /* Accumulate weighted expert output — AVX2 */
                 {
@@ -1980,7 +1959,7 @@ int main(int argc, char** argv) {
                 }
             }
 
-            if (normed_q8k) _freea(normed_q8k);
+            if (normed_q8k) free(normed_q8k);
 
         skip_routed_moe_label:
             /* Trace: ffn_moe_out = routed-experts sum only (BEFORE shared expert) */
@@ -2138,6 +2117,8 @@ int main(int argc, char** argv) {
                 int test_tokens[] = {32, 53, 872, 198, 13, 7294, 2245, 154378};
                 for (int tt = 0; tt < 8; tt++) {
                     int tid = test_tokens[tt];
+                    /* Diagnostic IDs belong to Qwen's vocabulary, not every fixture. */
+                    if (tid >= vocab_size) continue;
                     double dot = 0.0;
                     double row_norm_sq = 0.0;
                     /* Dequant entire row and compute both dot product and L2 norm */
@@ -2168,11 +2149,11 @@ int main(int argc, char** argv) {
                 }
             }
 
-            LARGE_INTEGER lm_t0, lm_t1;
-            QueryPerformanceCounter(&lm_t0);
+            int64_t lm_t0, lm_t1;
+            lm_t0 = lm_clock_now();
             quant_matvec(logits, lm_head, normed, vocab_size, H, lm_head_type);
-            QueryPerformanceCounter(&lm_t1);
-            double lm_ms = (double)(lm_t1.QuadPart - lm_t0.QuadPart) / freq.QuadPart * 1000.0;
+            lm_t1 = lm_clock_now();
+            double lm_ms = (double)(lm_t1 - lm_t0) / freq * 1000.0;
             if (tok >= prompt_len - 1) fprintf(stderr, "  LM_HEAD t%d: %.0f ms\n", tok, lm_ms);
         } else {
             /* LM head not loaded (too large) — use normed[0] as dummy logit */
@@ -2203,7 +2184,8 @@ int main(int argc, char** argv) {
                 int nsent = sizeof(sentinels)/sizeof(sentinels[0]);
                 fprintf(g_trace_out, "\n# sentinel logits (tok=%d)\n", tok);
                 for (int s = 0; s < nsent; s++)
-                    fprintf(g_trace_out, "SENTINEL\t%d\t%.8g\n", sentinels[s], logits[sentinels[s]]);
+                    if (sentinels[s] < vocab_size)
+                        fprintf(g_trace_out, "SENTINEL\t%d\t%.8g\n", sentinels[s], logits[sentinels[s]]);
                 /* top-20 */
                 int top_ids[20]; float top_vals[20];
                 for (int ii = 0; ii < 20; ii++) { top_ids[ii] = 0; top_vals[ii] = -1e30f; }
@@ -2245,12 +2227,12 @@ int main(int argc, char** argv) {
             fprintf(stderr, "Top-10 logits [tok=%d]:\n", tok);
             for (i = 0; i < 10; i++)
                 fprintf(stderr, "  #%d: id=%d logit=%.4f\n", i+1, top_ids[i], top_vals[i]);
-            /* Check where expected token ranks */
-            fprintf(stderr, "  Token 248045 (<|im_start|>) logit=%.4f\n", logits[248045]);
-            fprintf(stderr, "  Token 248068 (<think>) logit=%.4f\n", logits[248068]);
-            fprintf(stderr, "  Token 248069 (</think>) logit=%.4f\n", logits[248069]);
-            fprintf(stderr, "  Token 198 (\\n) logit=%.4f  Token 9419 (Hello) logit=%.4f\n",
-                logits[198], logits[9419]);
+            /* Only inspect sentinels present in this model's vocabulary. */
+            const int diagnostic_ids[] = {248045, 248068, 248069, 198, 9419};
+            for (size_t di = 0; di < sizeof(diagnostic_ids)/sizeof(diagnostic_ids[0]); ++di) {
+                int id = diagnostic_ids[di];
+                if (id < vocab_size) fprintf(stderr, "  Token %d logit=%.4f\n", id, logits[id]);
+            }
             int nan_count = 0;
             for (i = 0; i < vocab_size; i++) if (logits[i] != logits[i]) nan_count++;
             if (nan_count > 0) fprintf(stderr, "WARNING: %d NaN logits!\n", nan_count);
@@ -2266,8 +2248,8 @@ int main(int argc, char** argv) {
             }
         }
 
-        QueryPerformanceCounter(&tok_end);
-        double tok_ms = (double)(tok_end.QuadPart - tok_start.QuadPart) / freq.QuadPart * 1000.0;
+        tok_end = lm_clock_now();
+        double tok_ms = (double)(tok_end - tok_start) / freq * 1000.0;
 
         /* Track logit confidence during prompt (correct token logit + margin) */
         if (tok + 1 < prompt_len) {
@@ -2306,8 +2288,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    QueryPerformanceCounter(&gen_end);
-    double total_ms = (double)(gen_end.QuadPart - gen_start.QuadPart) / freq.QuadPart * 1000.0;
+    gen_end = lm_clock_now();
+    double total_ms = (double)(gen_end - gen_start) / freq * 1000.0;
     double tps = tokens_generated / (total_ms / 1000.0);
 
     fprintf(stderr, "\n=== Generation Complete ===\n");
@@ -2320,19 +2302,38 @@ int main(int argc, char** argv) {
     printf("{\"tok_s\": %.2f, \"tokens\": %d, \"total_ms\": %.1f, \"status\": \"ok\"}\n",
            tps, tokens_generated, total_ms);
 
-    /* Cleanup */
-    for (i = 0; i < cfg.num_layers; i++) kv_cache_free(&kv_caches[i]);
+    /* All synchronous CPU reads/compute are complete. Drain the GPU before
+     * releasing any host tensors that a backend could still reference. */
+    if (use_gpu) gpu_shutdown();
+    for (i = 0; i < cfg.num_layers; i++) {
+        kv_cache_free(&kv_caches[i]);
+        dn_state_free(&dn_states[i]);
+        LayerWeights* lw = &layers[i];
+        /* Each weight load owns a distinct malloc allocation. */
+        free(lw->wq); free(lw->wk); free(lw->wv); free(lw->wo);
+        free(lw->attn_norm); free(lw->ffn_norm); free(lw->q_norm); free(lw->k_norm);
+        free(lw->gate_inp); free(lw->post_attn_norm);
+        free(lw->w_qkv); free(lw->w_attn_gate); free(lw->w_alpha); free(lw->w_beta); free(lw->w_ssm_out);
+        free(lw->ssm_a); free(lw->ssm_dt_bias); free(lw->ssm_norm_w); free(lw->ssm_conv1d_w);
+        free(lw->shexp_gate); free(lw->shexp_up); free(lw->shexp_down); free(lw->shexp_gate_inp);
+    }
+    free(dn_states);
+    for (i = 0; i < total_slots; ++i) free(expert_cache[i]);
+    free(expert_cache); free(cached_keys); free(cache_hit_counts); free(key_to_slot);
+    for (i = 0; i < 16; ++i)
+        for (int j = 0; j < 3; ++j) lm_aligned_free(io_pool[i][j]);
+    free(embd_data); free(final_norm); free(lm_head);
     free(kv_caches);
-    _aligned_free(hidden); _aligned_free(residual); _aligned_free(normed);
-    _aligned_free(q); _aligned_free(k_cur); _aligned_free(v_cur);
-    _aligned_free(attn_out); _aligned_free(o_out);
-    _aligned_free(gate_buf); _aligned_free(up_buf); _aligned_free(act_buf);
-    _aligned_free(expert_out); _aligned_free(moe_out);
-    _aligned_free(expert_buf);
+    lm_aligned_free(hidden); lm_aligned_free(residual); lm_aligned_free(normed);
+    lm_aligned_free(q); lm_aligned_free(k_cur); lm_aligned_free(v_cur);
+    lm_aligned_free(attn_out); lm_aligned_free(o_out);
+    lm_aligned_free(gate_buf); lm_aligned_free(up_buf); lm_aligned_free(act_buf);
+    lm_aligned_free(expert_out); lm_aligned_free(moe_out);
+    lm_aligned_free(expert_buf);
     free(logits);
     free(layers);
     close_shard_handles(&model);
-    if (use_gpu) gpu_shutdown();
+    if (g_trace_out) fclose(g_trace_out);
 
     /* Phase 4.1: dump per-(layer,expert) access counter for hot/cold analysis */
     if (g_expert_trace_enabled && g_expert_trace_path) {

@@ -1,4 +1,6 @@
 #pragma once
+/* Portable heap temporaries must be released before returning. */
+#include "../platform/runtime.h"
 /*
  * Q4_K_M Dequantization — Standard GGML format
  *
@@ -180,7 +182,7 @@ static inline void q4k_matvec(
 
     /* Pre-quantize activation vector to Q8_K (once, reused for all rows) */
     int num_blocks = in_dim / Q8K_QK;
-    block_q8_K* x_q8 = (block_q8_K*)_malloca(num_blocks * sizeof(block_q8_K));
+    block_q8_K* x_q8 = (block_q8_K*)lm_temp_alloc(num_blocks * sizeof(block_q8_K));
     if (!x_q8) {
         /* Fallback to float path */
         int row;
@@ -206,7 +208,7 @@ static inline void q4k_matvec(
         }
         out[row] = sum;
     }
-    _freea(x_q8);
+    free(x_q8);
 }
 
 /* Q4_K matvec with externally pre-quantized Q8_K activations

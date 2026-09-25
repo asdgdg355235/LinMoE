@@ -1,4 +1,6 @@
 #pragma once
+/* Portable heap temporaries must be released before returning. */
+#include "../platform/runtime.h"
 /*
  * Q5_K Dequantization — AVX-512 + Integer Accumulation
  *
@@ -166,7 +168,7 @@ static inline void q5k_matvec(
 
     /* Pre-quantize activation to Q8_K */
     int num_blocks = in_dim / Q8K_QK;
-    block_q8_K* x_q8 = (block_q8_K*)_malloca(num_blocks * sizeof(block_q8_K));
+    block_q8_K* x_q8 = (block_q8_K*)lm_temp_alloc(num_blocks * sizeof(block_q8_K));
     if (!x_q8) {
         /* Float fallback */
         int row;
@@ -191,7 +193,7 @@ static inline void q5k_matvec(
             sum += q5k_dot_q8k(&rb[b], &x_q8[b]);
         out[row] = sum;
     }
-    _freea(x_q8);
+    free(x_q8);
 }
 
 /* Q5_K matvec with externally pre-quantized Q8_K activations */

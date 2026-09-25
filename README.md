@@ -1,4 +1,20 @@
-# WinMoE
+# LinMoE
+
+Active repository: **asdgdg355235/LinMoE**. Native Linux/AMD development targets
+ROCm/HIP on RX 6950 XT / gfx1030. Upstream WinMoE is a reference only.
+
+The first native **CPU foundation** builds with `make` and tests with `make check`.
+It currently requires an AVX-512-capable x86-64 CPU. HIP, O_DIRECT and io_uring are
+not implemented, and real-model Linux parity is not yet established.
+See [Linux port status and audit](docs/linux/PORT_STATUS.md) for exact commands,
+validation evidence, remaining correctness gates, and the implementation map.
+
+---
+
+The material below records inherited Windows/NVIDIA work; its results do not
+represent measurements of this Linux/AMD port.
+
+# WinMoE historical reference
 
 **Running Qwen3.5-397B (397 billion parameters) on a consumer Windows laptop at 1.9 tok/s.**
 

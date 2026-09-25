@@ -1,4 +1,6 @@
 #pragma once
+/* Portable heap temporaries must be released before returning. */
+#include "../platform/runtime.h"
 /*
  * Gated DeltaNet Implementation — The Critical Attention Layer
  *
@@ -241,8 +243,8 @@ static void deltanet_forward(
     float* V = qkv + DN_KEY_DIM + DN_KEY_DIM; /* [8192] = 64 value heads × 128 */
 
     /* 3. Compute gate parameters per head */
-    float* gate_decay = (float*)_malloca(DN_NUM_GATES * sizeof(float));
-    float* beta = (float*)_malloca(DN_NUM_GATES * sizeof(float));
+    float* gate_decay = (float*)lm_temp_alloc(DN_NUM_GATES * sizeof(float));
+    float* beta = (float*)lm_temp_alloc(DN_NUM_GATES * sizeof(float));
 
     for (h = 0; h < DN_NUM_GATES; h++) {
         /* Decay: g = exp(ssm_a * softplus(alpha + dt_bias))
@@ -253,7 +255,7 @@ static void deltanet_forward(
         /* Clamp to (0, 1] */
         if (a > 1.0f) a = 1.0f;
         if (a < 0.0f) a = 0.0f;
-        if (_isnan(a)) a = 0.99f;
+        if (isnan(a)) a = 0.99f;
         gate_decay[h] = a;
 
         /* Update rate: stable sigmoid */
@@ -373,5 +375,7 @@ static void deltanet_forward(
     /* 8. Output projection: gated[4096] → output[hidden_dim] */
     quant_matvec(output, w_out, gated, hidden_dim, DN_INNER, w_out_type);
 
-    /* Buffers are pre-allocated in DeltaNetState — no free needed */
+    /* State buffers are retained; recurrence temporaries belong to this call. */
+    free(gate_decay);
+    free(beta);
 }

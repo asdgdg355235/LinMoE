@@ -1,3 +1,15 @@
+# LinMoE native port status
+
+Current native milestone: CPU executable, bounded GGUF loader and checked
+synchronous buffered reads. Synthetic integration/reference checks pass.
+HIP and full-model parity remain pending. See
+[the current Linux port status](../../docs/linux/PORT_STATUS.md).
+
+The following section is inherited Windows/NVIDIA evidence and is retained
+for comparison; it is not a Linux/AMD performance claim.
+
+---
+
 # Master Status — WinMoE Custom Engine
 
 ## Current Performance

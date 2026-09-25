@@ -1,4 +1,6 @@
 #pragma once
+/* Portable heap temporaries must be released before returning. */
+#include "../platform/runtime.h"
 /*
  * Q8_0 Dequantization — simplest quantized format
  * 32 weights per block: 1 FP16 scale + 32 int8 values
@@ -31,7 +33,7 @@ static inline float q8_dot_block(const block_q8_0* block, const float* y) {
     return d * _mm512_reduce_add_ps(acc);
 }
 
-/* Q8_0 dot with Q8_K pre-quantized activations — VNNI integer accumulation */
+/* Q8_0 dot with Q8_K pre-quantized activations — exact AVX2 integer accumulation */
 static inline float q8_dot_q8k(const block_q8_0* w, const block_q8_K* a) {
     float d = fp16_to_fp32(w->d) * a->d;
 
@@ -39,14 +41,15 @@ static inline float q8_dot_q8k(const block_q8_0* w, const block_q8_K* a) {
     __m256i qw = _mm256_loadu_si256((const __m256i*)w->qs);
     __m256i qa = _mm256_loadu_si256((const __m256i*)a->qs);
 
-    /* VNNI: dpbusd requires unsigned × signed.
-       Sign trick: abs(weights) × sign-adjusted(activations) */
-    __m256i absw = _mm256_abs_epi8(qw);        /* make weights unsigned */
-    __m256i sign = _mm256_sign_epi8(qa, qw);   /* flip activation signs */
-
-    /* VNNI: fused u8×s8 → i32 accumulate in ONE instruction
-       Replaces: maddubs_epi16 + madd_epi16 + add_epi32 (3 instructions) */
-    __m256i acc = _mm256_dpbusd_epi32(_mm256_setzero_si256(), absw, sign);
+    /* Widen signed bytes before multiplying. This AVX2 baseline needs no
+     * VNNI and handles -128 exactly: negating an int8 activation for the old
+     * unsigned/signed trick overflows for that value. Pair sums fit int32. */
+    __m256i wlo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(qw));
+    __m256i whi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(qw, 1));
+    __m256i alo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(qa));
+    __m256i ahi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(qa, 1));
+    __m256i acc = _mm256_add_epi32(_mm256_madd_epi16(wlo, alo),
+                                  _mm256_madd_epi16(whi, ahi));
 
     /* Horizontal sum of 8 int32 values */
     __m256 vsum = _mm256_cvtepi32_ps(acc);
@@ -75,7 +78,7 @@ static inline void q8_matvec(
     int q8k_blocks = in_dim / Q8K_QK;
     block_q8_K* x_q8k = NULL;
     if (q8k_blocks > 0 && out_dim >= 128) {
-        x_q8k = (block_q8_K*)_malloca(q8k_blocks * sizeof(block_q8_K));
+        x_q8k = (block_q8_K*)lm_temp_alloc(q8k_blocks * sizeof(block_q8_K));
         if (x_q8k) quantize_row_q8_K(x_q8k, x, q8k_blocks * Q8K_QK);
     }
 
@@ -109,7 +112,7 @@ static inline void q8_matvec(
         }
         out[row] = sum;
     }
-    if (x_q8k) _freea(x_q8k);
+    if (x_q8k) free(x_q8k);
 }
 
 /* Dequantize a full Q8_0 row to FP32 (for embedding lookup) */
