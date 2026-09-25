@@ -5,6 +5,66 @@ Base audited: `asdgdg355235/LinMoE`, `master`,
 Target direction: Arch Linux, RX 6950 XT / gfx1030, HIP, NVMe-streamed MoE.
 This change implements a **CPU foundation**, not the completed AMD port.
 
+## HIP foundation milestone
+
+The branch now contains a staged HIP backend for the first AMD correctness
+milestone. It does **not** claim full GPU inference.
+
+- Build selection is explicit: `BACKEND=cpu` uses `gpu_offload_cpu.c`;
+  `BACKEND=hip` compiles `gpu_offload_hip.cpp` with configurable `HIPCC` and
+  `GPU_ARCH` (development default `gfx1030`). Ordinary runtime sources remain C.
+- HIP initialization enumerates devices, deterministically selects device 0,
+  reports name, `gcnArchName`, VRAM, runtime version and wave size, and creates
+  separate non-blocking compute/H2D/D2H streams. Partial failures destroy any
+  streams already created before returning failure.
+- The first supported kernel execution model is wave32. Initialization compares
+  the device-property and runtime-attribute wave sizes and rejects non-wave32
+  devices diagnostically rather than applying CUDA's 32-lane assumptions.
+- Q8_0 has three HIP implementations: single-thread reference, one-wave simple,
+  and 256-thread/shared-input implementation. The 34-byte packed block's FP16
+  scale is assembled bytewise and converted with HIP half intrinsics so the
+  two-byte scale never requires an unaligned device load.
+- `tests/hip_smoke_test.cpp` covers runtime/device query, allocation, async H2D,
+  kernel launch, synchronization, async D2H, value checking and free.
+- `tests/hip_q8_parity.cpp` builds deterministic independent CPU fixtures for
+  zeros, positive/negative/alternating signs, int8 extrema, ordinary/tiny FP16
+  scales, multiple rows and widths through 4096. It compares all three HIP
+  kernels to a double-accumulating scalar CPU oracle and cross-compares the HIP
+  implementations. The tolerance is fixed in source at
+  `abs_error <= 5e-2 + 5e-5 * abs(reference)`.
+- Runtime initialization is separated from full-inference capability. The HIP
+  backend reports foundation-only capability, so the existing unchecked
+  DeltaNet async path remains on CPU. CUDA advertises full capability. This is
+  required because several DeltaNet launch/wait/result calls do not have safe
+  per-operation fallback semantics.
+- The DeltaNet group-mapping discrepancy remains unresolved:
+  `deltanet_impl.h` uses `h / DN_HEADS_PER_GROUP`, while the GPU-assisted host
+  recurrence uses `h_idx % DN_NUM_KV_GROUPS`. No multi-group HIP DeltaNet work
+  should use either path as an oracle until reference intermediates settle it.
+
+Target-machine validation:
+
+```sh
+command -v hipcc
+hipcc --version
+rocminfo
+
+make clean BACKEND=cpu
+make BACKEND=cpu -j2
+make BACKEND=cpu check
+
+make clean BACKEND=hip
+make BACKEND=hip GPU_ARCH=gfx1030 -j2
+make BACKEND=hip GPU_ARCH=gfx1030 hip-check
+```
+
+If Arch exposes HIP outside `PATH`, override it explicitly, for example
+`make BACKEND=hip HIPCC=/opt/rocm/bin/hipcc GPU_ARCH=gfx1030 -j2`.
+
+**Validation status:** source-level integration has been reviewed, but this
+development environment has no ROCm compiler or RX 6950 XT. Do not mark HIP
+build/device/Q8 parity as passed until the commands above run on the target.
+
 ## What builds and runs
 
 - Native Linux C11/C++17/OpenMP build with GCC; no Wine, CUDA or HIP dependency.
