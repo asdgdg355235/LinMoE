@@ -3,24 +3,29 @@
 Base audited: `asdgdg355235/LinMoE`, `master`,
 `6aef92d7a947566b650b3231aa3169d71b26f15e`.
 Target direction: Arch Linux, RX 6950 XT / gfx1030, HIP, NVMe-streamed MoE.
-The CPU and HIP/Q8 foundations are established. The GQA Q/K/V extension is
-implemented but awaits target compilation and GPU parity; this is not a completed
-AMD inference port.
+The CPU and HIP/Q8 foundations are established. The complete staged GQA
+projection path (Q/K/V + Wo) is now validated on RX 6950 XT / gfx1030; this is
+still not a completed AMD inference port.
 
-## GQA Q/K/V milestone — target validation pending
+## GQA Q/K/V/Wo milestone — target validated
 
-Persistent Wq/Wk/Wv uploads, checked packed sizes, one shared input copy, shared
-Q8 kernel dispatch, synchronized host results, replacement/shutdown cleanup,
-and independent projection/inference fixtures are implemented. Attention and
-Wo stay on CPU. Hybrid inference is opt-in with `WINMOE_GQA_HIP=1`; the full
-inference gate remains closed. `hip-check` runs existing smoke/Q8 tests before
-new GQA and hybrid inference tests.
+Persistent Wq/Wk/Wv/Wo uploads, checked packed sizes, shared Q8 dispatch,
+synchronized host publication, four-matrix transactional replacement,
+failure-injection rollback, scratch resize/reuse and shutdown cleanup all pass.
+Attention itself remains on CPU. Hybrid inference is opt-in with
+`WINMOE_GQA_HIP=1`; the full-inference gate remains closed.
 
-The clean CPU suite and ASan/UBSan checks pass in this session. HIP compilation
-and new Q/K/V metrics remain unverified because this environment has no hipcc or
-AMD device. See [the exact implementation/validation handoff](HIP_GQA.md) for
-geometry, ownership, changed files, commands, results and blockers. Historical
-HIP foundation results below must not be interpreted as validation of this change.
+Target results:
+- Q+gate: max abs 0.001953125, RMSE 0.000416676675.
+- K: max abs 0.00161743164, RMSE 0.000359322842.
+- V: max abs 0.00146484375, RMSE 0.000346418818.
+- Wo: max abs 0.0029296875, RMSE 0.000574647851.
+- Hybrid 3-position logits: max abs 1.66893005e-06, RMSE 1.77150513e-07.
+- Four-matrix representative residency: 106.25 MiB per GQA layer.
+
+The deliberate invalid-request and out-of-memory diagnostics are negative-test
+coverage, not unexpected failures or real device exhaustion. See
+[the implementation/validation handoff](HIP_GQA.md) for full details.
 
 ## HIP foundation milestone
 
@@ -50,8 +55,8 @@ milestone. It does **not** claim full GPU inference.
   implementations. The tolerance is fixed in source at
   `abs_error <= 5e-2 + 5e-5 * abs(reference)`.
 - Runtime initialization is separated from full-inference capability. The HIP
-  backend rejects full-inference capability and exposes Q/K/V separately, so the unchecked
-  DeltaNet async path remains on CPU. CUDA advertises full capability. This is
+  backend rejects full-inference capability and exposes staged GQA projections
+  (Q/K/V/Wo) separately, so the unchecked DeltaNet async path remains on CPU. CUDA advertises full capability. This is
   required because several DeltaNet launch/wait/result calls do not have safe
   per-operation fallback semantics.
 - The DeltaNet group-mapping discrepancy remains unresolved:
@@ -151,6 +156,12 @@ equivalence is claimed yet.
 | CPU vs HIP Q8 optimized | 7 cases / 42 rows; max abs 9.765625e-4; RMSE 2.33337389e-4; max rel 9.18743188e-7 |
 | HIP single vs simple | Max abs 7.32421875e-4; RMSE 2.44237109e-4; max rel 3.63596812e-6 |
 | HIP single vs optimized | Max abs 1.09863281e-3; RMSE 3.94883249e-4; max rel 4.88258576e-6 |
+| GQA Q+gate | 36 calls; max abs 1.953125e-3; RMSE 4.16676675e-4 |
+| GQA K | 36 calls; max abs 1.61743164e-3; RMSE 3.59322842e-4 |
+| GQA V | 36 calls; max abs 1.46484375e-3; RMSE 3.46418818e-4 |
+| GQA Wo | 30 calls; max abs 2.9296875e-3; RMSE 5.74647851e-4; max rel 6.55173437e-4 |
+| GQA lifecycle | PASS: four-matrix replacement, Wo OOM/copy rollback, resize/reuse, shutdown |
+| GQA hybrid inference | PASS: 3 positions; max logit abs 1.66893005e-6; RMSE 1.77150513e-7 |
 | ASan + UBSan | Entire CPU `make check` suite passes with leak detection disabled |
 | LeakSanitizer | Environment rejects its tracing/thread inspection; no leak-free claim |
 | Real Qwen CPU/CUDA/HIP comparison | Not run |
@@ -242,17 +253,17 @@ allocation, storage, cache, and an expected output, **not general kernel parity*
 
 ## Next implementation order
 
-1. Run the implemented GQA Q/K/V fixtures and hybrid inference on gfx1030;
-   record Q/K/V metrics and resource-lifetime results before enabling the
-   currently opt-in path by default. See `HIP_GQA.md`.
-2. Resolve the DeltaNet mapping discrepancy and establish nonzero multi-group
+1. Establish independent Q4_K and Q5_K CPU-vs-HIP block/matvec parity before
+   touching expert kernels or cache residency. Reuse the Q8 test methodology:
+   fixed deterministic fixtures, signed/extreme values, multiple blocks/rows,
+   fixed tolerances and GPU cross-checks where useful.
+2. Keep GQA attention on CPU for now; the validated Q/K/V/Wo projection boundary
+   remains opt-in through `WINMOE_GQA_HIP=1`.
+3. Resolve the DeltaNet mapping discrepancy and establish nonzero multi-group
    CPU/reference fixtures before using either existing recurrence path as the
    oracle for HIP DeltaNet work.
-3. Port the remaining GQA output projection once Q/K/V parity is established;
-   keep the staged capability gate until the complete GQA call chain has safe
-   fallback/error semantics.
-4. Only then address Q4_K/Q5_K and expert kernels/cache. Preserve independent
-   CPU reference paths and add block-level parity tests first.
+4. After Q4_K/Q5_K parity, port expert kernels/cache incrementally with explicit
+   ownership, VRAM accounting and rollback tests.
 5. Measure the buffered storage baseline, then add O_DIRECT alignment discovery
    and io_uring incrementally, with cancellation and buffer lifetime tests.
 6. Query VRAM budgets with headroom, instrument residency and stalls, and measure
