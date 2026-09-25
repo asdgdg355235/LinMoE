@@ -61,14 +61,19 @@ make BACKEND=hip GPU_ARCH=gfx1030 hip-check
 If Arch exposes HIP outside `PATH`, override it explicitly, for example
 `make BACKEND=hip HIPCC=/opt/rocm/bin/hipcc GPU_ARCH=gfx1030 -j2`.
 
-**Validation status:** source-level integration has been reviewed, but this
-development environment has no ROCm compiler or RX 6950 XT. Do not mark HIP
-build/device/Q8 parity as passed until the commands above run on the target.
+**Validation status:** verified on the target Arch Linux system with an
+AMD Radeon RX 6950 XT / gfx1030. The HIP build completed, device 0 was identified
+as gfx1030 with 16,368 MiB reported VRAM and wave32, the smoke test passed, and
+all three Q8_0 HIP kernels passed the independent CPU parity suite. Full-model
+HIP inference is still deliberately disabled.
 
 ## What builds and runs
 
-- Native Linux C11/C++17/OpenMP build with GCC; no Wine, CUDA or HIP dependency.
-- CPU executable `build/linux-cpu/linmoe` and metadata tool `linmoe-inspect`.
+- Native Linux C11/C++17/OpenMP CPU build with GCC and no Wine/CUDA/HIP
+  dependency; optional HIP backend objects/tests are compiled and linked with
+  ROCm `hipcc`.
+- CPU executable `build/linux-cpu/linmoe`, HIP foundation executable
+  `build/linux-hip/linmoe`, and metadata tool `linmoe-inspect`.
 - Checked buffered `pread` storage: explicit offsets, 64-bit addressing, retry on
   EINTR, short-read completion, EOF/range checks and diagnostic failures.
 - Existing scheduler start/wait interface backed by synchronous reads on Linux.
@@ -107,22 +112,31 @@ above restores K=10 for comparison. `WINMOE_*` names remain compatible.
 
 ## Evidence
 
-Test environment: Linux x86-64 container, GCC 13, host reports AVX-512 features.
-No AMD device, ROCm compiler/runtime, real model, or target Arch machine was
-available. No throughput improvement or real-model equivalence is claimed.
+CPU sanitizer validation was originally performed in a Linux x86-64 container
+with GCC 13 and AVX-512 host features. The CPU release regression suite and HIP
+foundation were subsequently verified on the target Arch Linux machine with an
+AMD Radeon RX 6950 XT / gfx1030. No throughput improvement or real-model
+equivalence is claimed yet.
 
 | Check | Result |
 |---|---|
-| `make -j2 check` | Pass |
+| `make BACKEND=cpu check` | Pass on target Arch system |
 | GGUF synthetic cases | 133 pass, including every incomplete prefix of a valid fixture |
-| Q6_K scalar versus AVX2 | 3,000 pairs pass; max abs 3.662109e-4, RMSE 4.061567e-5 in the release build |
+| Q6_K scalar versus AVX2 | 3,000 pairs pass; max abs 3.662109e-4, RMSE 4.061567e-5 |
 | Q8 signed integer dot | All 65,536 constant int8 pairs plus mixed lanes pass exactly |
 | POSIX reads | Unaligned payloads, exact EOF, sparse >4 GiB, post-open truncation, invalid ranges/fds pass |
-| Analytic inference | GQA + DeltaNet, cold/hot cache, all 64 emitted logits checked |
-| ASan + UBSan | Entire `make check` suite passes with leak detection disabled |
+| Analytic inference | GQA + DeltaNet, two positions, cold/hot cache, logits checked |
+| HIP build | Pass with `BACKEND=hip GPU_ARCH=gfx1030` |
+| HIP device diagnostics | RX 6950 XT; gfx1030; 16,368 MiB VRAM; wave32; HIP runtime 70253211 |
+| HIP smoke | Pass: init, properties, allocation, H2D, kernel, D2H, validation, free |
+| CPU vs HIP Q8 single | 7 cases / 42 rows; max abs 1.46484375e-3; RMSE 4.41727480e-4; max rel 5.19426715e-6 |
+| CPU vs HIP Q8 simple | 7 cases / 42 rows; max abs 9.765625e-4; RMSE 2.52418728e-4; max rel 2.04786955e-6 |
+| CPU vs HIP Q8 optimized | 7 cases / 42 rows; max abs 9.765625e-4; RMSE 2.33337389e-4; max rel 9.18743188e-7 |
+| HIP single vs simple | Max abs 7.32421875e-4; RMSE 2.44237109e-4; max rel 3.63596812e-6 |
+| HIP single vs optimized | Max abs 1.09863281e-3; RMSE 3.94883249e-4; max rel 4.88258576e-6 |
+| ASan + UBSan | Entire CPU `make check` suite passes with leak detection disabled |
 | LeakSanitizer | Environment rejects its tracing/thread inspection; no leak-free claim |
 | Real Qwen CPU/CUDA/HIP comparison | Not run |
-| RX 6950 XT execution | Not run |
 | Windows/CUDA regression | Not run |
 
 Sanitizer reproduction:
@@ -146,7 +160,7 @@ allocation, storage, cache, and an expected output, **not general kernel parity*
 | Metadata and shards | `gguf_parser.h`: fixed 4,000 tensor / 8 shard directory; bounded parsing and range validation in this change |
 | CPU math | `attention.h`, `transformer.h`, `deltanet_impl.h`, `q4k_dequant.h`, `q5k_dequant.h`, `q6k_dequant.h`, `q8_dequant.h`, `q8k_quant.h` |
 | IQ2 reference | `iq2_dequant*.h` and legacy expert helpers; not a supported generic matvec dispatch in the active engine |
-| GPU boundary | `gpu_offload.h`; CPU implementation declines initialization and exposes no GPU data |
+| GPU boundary | `gpu_offload.h`; CPU declines initialization, CUDA advertises full inference, staged HIP initializes but advertises foundation-only capability |
 | CUDA implementation | `gpu_offload.cu`: Q8/Q4/Q5 matvecs, expert/SwiGLU/fused/batch paths, FP32 router, weight/cache allocation, streams/events |
 | GPU attention split | GQA/DeltaNet projections offloaded; attention and recurrence remain in host code |
 | CUDA synchronization | Compute/H2D/D2H/expert streams; two pipeline slots with pinned result buffers and event dependencies; synchronous expert paths also present |
@@ -159,7 +173,7 @@ allocation, storage, cache, and an expected output, **not general kernel parity*
 | Other engine files | `engine.cpp`, scheduler/cache classes, slab/replay/integrated benchmarks are historical or experimental paths; not linked into native inference |
 | Python tools | Repacking, trace analysis, model/reference comparisons and experiments remain separate; many scripts contain Windows paths |
 | Build | New root Makefile; existing manual MSVC/nvcc instructions retained as historical reference |
-| Portability backlog | Win32 APIs remain in legacy benchmarks and tests; no io_uring, O_DIRECT or HIP implementation added |
+| Portability backlog | Win32 APIs remain in legacy benchmarks/tests; HIP foundation exists, but no full HIP inference, io_uring or O_DIRECT implementation yet |
 
 ## Defects addressed for this baseline
 
@@ -196,8 +210,10 @@ allocation, storage, cache, and an expected output, **not general kernel parity*
   but every model-specific shape/type relationship is not yet validated.
   Do not treat this as a hardened executor for arbitrary untrusted GGUFs.
 - Some inherited allocations, trace writes and numerical failure paths still
-  lack complete error propagation. GPU return codes and initialization cleanup
-  need systematic review before enabling HIP.
+  lack complete error propagation. HIP foundation calls are checked and partial
+  initialization cleans up correctly, but the inherited high-level CUDA-style
+  inference API still needs equivalent per-operation error handling before full
+  HIP inference can be enabled.
 - Legacy Win32 read completion errors and synchronous-handle async fallback
   remain unsafe in the reference path; the native reader does not use them.
 - CUDA has wave32 masks/reductions, fixed dimensions and launch geometries,
@@ -209,14 +225,17 @@ allocation, storage, cache, and an expected output, **not general kernel parity*
 
 ## Next implementation order
 
-1. Resolve the DeltaNet mapping discrepancy and establish nonzero CPU operation
-   fixtures plus real-model intermediate/logit reference comparisons.
-2. Decide an AVX2-only host baseline, preserving existing fast paths behind
-   explicit build/dispatch choices rather than assuming AVX-512 availability.
-3. Add an optional HIP initialization/allocation/copy test with gfx1030 build
-   discovery, clear runtime diagnostics, and device execution on the RX 6950 XT.
-4. Port and independently compare Q8 operations, then attention/projections and
-   Q4/Q5/expert operations. Preserve CPU subsystem switches.
+1. Reuse the validated Q8_0 primitive for GQA Q/K/V projection upload and
+   matvec offload, while retaining host attention and CPU fallback. Add
+   deterministic CPU-vs-HIP projection fixtures before enabling it in inference.
+2. Resolve the DeltaNet mapping discrepancy and establish nonzero multi-group
+   CPU/reference fixtures before using either existing recurrence path as the
+   oracle for HIP DeltaNet work.
+3. Port the remaining GQA output projection once Q/K/V parity is established;
+   keep the staged capability gate until the complete GQA call chain has safe
+   fallback/error semantics.
+4. Only then address Q4_K/Q5_K and expert kernels/cache. Preserve independent
+   CPU reference paths and add block-level parity tests first.
 5. Measure the buffered storage baseline, then add O_DIRECT alignment discovery
    and io_uring incrementally, with cancellation and buffer lifetime tests.
 6. Query VRAM budgets with headroom, instrument residency and stalls, and measure
