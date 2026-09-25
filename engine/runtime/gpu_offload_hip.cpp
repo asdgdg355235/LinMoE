@@ -915,10 +915,11 @@ extern "C" int gpu_gqa_output(int layer,
     size_t weight_bytes = 0, input_bytes = 0, output_bytes = 0;
     if (checked_q8_sizes(hidden_dim, attn_dim, &weight_bytes,
                          &input_bytes, &output_bytes) != 0 ||
-        input_bytes > SIZE_MAX - output_bytes) {
+        weight_bytes != wo.bytes || input_bytes > SIZE_MAX - output_bytes) {
         fprintf(stderr,
-                "LinMoE HIP: invalid GQA Wo scratch size layer=%d input=%d output=%d\n",
-                layer, attn_dim, hidden_dim);
+                "LinMoE HIP: invalid GQA Wo sizing layer=%d input=%d output=%d "
+                "packed=%zu/%zu\n",
+                layer, attn_dim, hidden_dim, weight_bytes, wo.bytes);
         return -1;
     }
     size_t total = input_bytes + output_bytes;
