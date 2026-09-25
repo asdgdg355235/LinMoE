@@ -115,12 +115,19 @@ $(BUILD)/hip-gqa-parity.o: tests/hip_gqa_parity.cpp tests/hip_q8_fixture.h $(RUN
 $(BUILD)/hip-gqa-parity: $(BUILD)/hip-gqa-parity.o $(BUILD)/gpu_offload_hip.o
 	$(HIPCC) $(HIP_ARCH_FLAGS) $^ -o $@
 
-# Commands run in acceptance order: primitive, persistent projections, then the
-# opt-in inference boundary. A failing prerequisite prevents inference testing.
-hip-check: hip-toolchain-check $(BUILD)/hip-smoke-test $(BUILD)/hip-q8-parity $(BUILD)/hip-gqa-parity $(BUILD)/linmoe
+$(BUILD)/hip-gqa-output.o: tests/hip_gqa_output.cpp tests/hip_q8_fixture.h $(RUNTIME)/gpu_offload.h $(RUNTIME)/gpu_offload_hip_test.h | $(BUILD) hip-toolchain-check
+	$(HIPCC) $(CPPFLAGS) $(HIPFLAGS) -std=c++17 $(HIP_ARCH_FLAGS) -c $< -o $@
+
+$(BUILD)/hip-gqa-output: $(BUILD)/hip-gqa-output.o $(BUILD)/gpu_offload_hip.o
+	$(HIPCC) $(HIP_ARCH_FLAGS) $^ -o $@
+
+# Commands run in acceptance order: primitive, persistent Q/K/V, persistent Wo,
+# then the opt-in inference boundary. A failing prerequisite stops the sequence.
+hip-check: hip-toolchain-check $(BUILD)/hip-smoke-test $(BUILD)/hip-q8-parity $(BUILD)/hip-gqa-parity $(BUILD)/hip-gqa-output $(BUILD)/linmoe
 	$(BUILD)/hip-smoke-test
 	$(BUILD)/hip-q8-parity
 	$(BUILD)/hip-gqa-parity
+	$(BUILD)/hip-gqa-output
 	python3 tests/hip_gqa_inference.py $(BUILD)/linmoe
 
 else

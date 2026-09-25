@@ -1,4 +1,4 @@
-# HIP GQA Q/K/V implementation and validation handoff
+# HIP GQA Q/K/V/Wo implementation and validation handoff
 
 Baseline: `91bbb6baf7c1111f636361f778d191149481fcea`, branch
 `chatgpt/hip-foundation-gfx1030`, in the authoritative LinMoE repository.
@@ -6,16 +6,19 @@ The local session initially held only the CPU baseline. The existing HIP branch
 was fetched and its incremental changes applied after verifying it preserved
 all local CPU changes. The HIP foundation was recovered, not reimplemented.
 
-Status: **GQA implementation is ready for target compilation and validation;
-new GPU parity is not yet established.** This environment has no `hipcc`,
-`/dev/kfd`, or AMD GPU. Both HIP build and test attempts fail with the intended
-missing-compiler diagnostic. No new GPU measurements are claimed.
+Status: **Q/K/V is target-validated on the RX 6950 XT; Wo is implemented and
+requires target validation.** The validated Q/K/V milestone completed 36
+projection calls with max absolute differences 0.001953125 (Q+gate),
+0.001617432 (K), and 0.001464844 (V). The three-position Q/K/V hybrid fixture
+had zero logit difference. This environment still has no local `hipcc` or AMD
+device, so the newly added Wo path is not claimed PASS until target output is
+returned.
 
 ## Data flow and geometry
 
-CPU RMSNorm → one H2D FP32 input copy → existing HIP simple Q8 kernel for Wq,
-Wk, Wv → three D2H staging copies → checked compute-stream synchronization →
-publish Q/K/V to the caller → existing CPU attention and CPU Wo.
+CPU RMSNorm → HIP Wq/Wk/Wv → CPU QK norm/RoPE/KV cache/attention/gating →
+HIP Wo → existing residual path. Q/K/V and Wo reuse the same validated simple
+wave32 Q8 kernel and compute stream; attention itself remains on CPU.
 
 QK normalization, RoPE, KV cache append, score computation, softmax, value
 accumulation, sigmoid gating, and output projection remain on CPU for HIP.
@@ -41,10 +44,14 @@ The backend preserves every output row in order; the CPU deinterleaves it.
 
 ## Ownership and failures
 
-Each layer index 0–63 owns Wq/Wk/Wv device allocations until replacement or
-shutdown. Upload borrows host pointers only until its checked synchronization
+Each layer index 0–63 owns Wq/Wk/Wv and, when supplied, Wo device allocations
+until replacement or shutdown. Upload borrows host pointers only until its checked synchronization
 finishes. Host model weights remain owned by the existing loader for CPU use.
-Wo is ignored by HIP upload, and `gpu_gqa_output()` remains unimplemented.
+Wo is now optional in the HIP upload API for compatibility with the established
+Q/K/V-only fixture. When supplied, it is the fourth matrix in the same
+transaction and maps `q_gate_dim/2` attention values to `hidden_dim` outputs.
+`gpu_gqa_output()` uses the common Q8 launch helper and publishes host output
+only after synchronization.
 
 Checked packed bytes are `output * (input / 32) * 34`, using `size_t` and the
 existing overflow helper. Input width must be positive and divisible by 32.
@@ -66,8 +73,11 @@ three results are ready. GQA calls are serialized on one host thread. Shutdown
 frees every layer, scratch, staging, then streams. Device allocation accounting
 includes persistent matrices and scratch; it excludes runtime/driver overhead.
 
-At `H=4096, Q+gate=16384, K=V=512`, calculated weight storage is **72.25 MiB**
-(75,759,616 bytes) per layer; scratch is **0.08203125 MiB** (86,016 bytes).
+At `H=4096, Q+gate=16384, K=V=512`, Q/K/V storage remains **72.25 MiB**
+(75,759,616 bytes). Wo adds 35,651,584 bytes, for **106.25 MiB** (111,411,200
+bytes) of four-matrix residency per layer. Q/K/V scratch remains the larger
+requirement at 86,016 bytes; Wo alone needs 49,152 bytes, so the shared grow-only
+scratch allocation does not increase for representative geometry.
 These are calculated sizes, not measured VRAM. Replacement temporarily needs
 both old and new weight storage. The GPU fixture verifies tracked usage.
 
@@ -214,5 +224,6 @@ unsupported. No full GPU inference is advertised.
 The DeltaNet mapping disagreement remains deferred: CPU uses
 `h / DN_HEADS_PER_GROUP`, GPU-assisted host recurrence uses
 `h_idx % DN_NUM_KV_GROUPS`. Resolve it with a pinned reference and a multi-group
-regression before any HIP DeltaNet work. The next bounded subsystem, after GQA
-Q/K/V acceptance, is the GQA Wo output projection using the same Q8 helper.
+regression before any HIP DeltaNet work. The current bounded subsystem is GQA Wo output projection using the same Q8
+helper. After Wo target acceptance, complete-GQA correctness is established and
+DeltaNet should remain deferred until its group-mapping discrepancy is resolved.

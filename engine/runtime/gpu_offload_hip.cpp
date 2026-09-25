@@ -283,28 +283,38 @@ static int launch_q8(float* d_output, const unsigned char* d_weights,
     return check_hip(context, hipGetLastError(), 0, g_hip.device);
 }
 
-/* The layer bound matches the legacy GPU API. Each layer owns its three packed
- * matrices; uploads borrow host pointers only until their stream is drained.
- * Re-upload builds a complete replacement before retiring the old allocation.
- * This backend, like the existing inference loop, is single-host-thread only. */
+/* The layer bound matches the legacy GPU API. Each layer owns Q/K/V and,
+ * when supplied, Wo. Uploads borrow host pointers only until their stream is
+ * drained. Re-upload builds the complete requested replacement before retiring
+ * the old allocation, so a failed Wo transfer cannot partially replace Q/K/V.
+ * Q/K/V-only uploads remain valid for the established projection tests. */
 constexpr int kGqaLayers = 64;
+constexpr int kGqaMatrices = 4;
 struct GqaMatrix {
     unsigned char* data;
     size_t bytes;
     int input_dim, output_dim;
 };
-struct GqaLayer { GqaMatrix matrix[3]; bool loaded; };
+struct GqaLayer {
+    GqaMatrix matrix[kGqaMatrices];
+    bool loaded;
+    bool wo_loaded;
+};
 GqaLayer g_gqa[kGqaLayers] = {};
 
-/* One reusable allocation holds input then Q, K and V. It grows transactionally
- * across models/layers. Host staging publishes all three results only on success. */
+/* One reusable allocation is shared by Q/K/V and Wo calls. Each operation
+ * computes its own required capacity; the buffer only grows, so a later smaller
+ * call reuses the allocation without assuming Q/K/V and Wo dimensions match.
+ * Host staging is not published to callers until synchronization succeeds. */
 void* g_gqa_scratch = nullptr;
 float* g_gqa_host = nullptr;
 size_t g_gqa_scratch_bytes = 0;
 bool g_gqa_faulted = false;
-/* Test-only deterministic OOM injection exercises partial replacement rollback
- * without exhausting a real GPU. It is disabled during normal execution. */
+/* Test-only deterministic failures exercise transaction rollback without
+ * exhausting or corrupting a real device. Copy injection occurs before the
+ * selected enqueue, while earlier copies are still drained before cleanup. */
 int g_gqa_fail_alloc_after = -1;
+int g_gqa_fail_copy_after = -1;
 
 static void gqa_context(char* text, size_t count, const char* op, int layer,
                         const char* matrix, int input_dim, int output_dim) {
@@ -313,8 +323,8 @@ static void gqa_context(char* text, size_t count, const char* op, int layer,
 }
 
 static void free_gqa_layer(GqaLayer& storage, int layer) {
-    const char* names[] = {"Wq", "Wk", "Wv"};
-    for (int i = 0; i < 3; ++i) {
+    const char* names[] = {"Wq", "Wk", "Wv", "Wo"};
+    for (int i = 0; i < kGqaMatrices; ++i) {
         GqaMatrix& m = storage.matrix[i];
         char context[160];
         gqa_context(context, sizeof(context), "hipFree", layer, names[i],
@@ -325,6 +335,7 @@ static void free_gqa_layer(GqaLayer& storage, int layer) {
         m = {};
     }
     storage.loaded = false;
+    storage.wo_loaded = false;
 }
 
 static int reserve_gqa_scratch(size_t bytes, const char* context) {
@@ -469,6 +480,7 @@ extern "C" void gpu_shutdown(void) {
     g_gqa_scratch_bytes = 0;
     g_gqa_faulted = false;
     g_gqa_fail_alloc_after = -1;
+    g_gqa_fail_copy_after = -1;
 
     if (g_hip.allocated_bytes != 0)
         fprintf(stderr, "LinMoE HIP: shutdown with %zu tracked device bytes still allocated\n",
@@ -708,6 +720,10 @@ extern "C" void gpu_hip_test_gqa_fail_alloc_after(int count) {
     g_gqa_fail_alloc_after = count;
 }
 
+extern "C" void gpu_hip_test_gqa_fail_copy_after(int count) {
+    g_gqa_fail_copy_after = count;
+}
+
 extern "C" int gpu_upload_gqa_weights(int layer,
     const void* wq_q8, int wq_rows, int wq_cols,
     const void* wk_q8, int wk_rows, int wk_cols,
@@ -715,34 +731,48 @@ extern "C" int gpu_upload_gqa_weights(int layer,
     const void* wo_q8, int wo_rows, int wo_cols) {
     /* Preserve the inherited ABI: rows is GGUF dims[0] (input width), cols is
      * dims[1] (output count), despite their misleading mathematical names.
-     * Wo is deliberately neither read nor retained: output remains on CPU. */
-    (void)wo_q8; (void)wo_rows; (void)wo_cols;
+     * Wo is optional for Q/K/V-only validation. When present it must map the
+     * ungated attention width (Q+gate / 2) back to hidden width. */
+    const bool have_wo = wo_q8 != nullptr || wo_rows != 0 || wo_cols != 0;
+    const bool wo_valid = !have_wo ||
+        (wo_q8 != nullptr && wo_rows > 0 && wo_cols > 0 &&
+         (int64_t)wo_rows * 2 == (int64_t)wq_cols && wo_cols == wq_rows);
     if (!g_hip.initialized || g_gqa_faulted || layer < 0 || layer >= kGqaLayers ||
         !wq_q8 || !wk_q8 || !wv_q8 || wq_rows != wk_rows || wq_rows != wv_rows ||
         wk_cols != wv_cols || wk_cols <= 0 || wq_cols <= 0 ||
-        (int64_t)wq_cols % (2LL * wk_cols) != 0) {
-        fprintf(stderr, "LinMoE HIP: invalid GQA upload layer=%d Wq=%dx%d Wk=%dx%d Wv=%dx%d\n",
-                layer, wq_rows, wq_cols, wk_rows, wk_cols, wv_rows, wv_cols);
+        (int64_t)wq_cols % (2LL * wk_cols) != 0 || !wo_valid) {
+        fprintf(stderr,
+                "LinMoE HIP: invalid GQA upload layer=%d Wq=%dx%d Wk=%dx%d "
+                "Wv=%dx%d Wo=%dx%d present=%d\n",
+                layer, wq_rows, wq_cols, wk_rows, wk_cols, wv_rows, wv_cols,
+                wo_rows, wo_cols, have_wo ? 1 : 0);
         return -1;
     }
-    const void* host[] = {wq_q8, wk_q8, wv_q8};
-    const char* names[] = {"Wq", "Wk", "Wv"};
-    int outputs[] = {wq_cols, wk_cols, wv_cols};
+
+    const void* host[kGqaMatrices] = {wq_q8, wk_q8, wv_q8, wo_q8};
+    const char* names[kGqaMatrices] = {"Wq", "Wk", "Wv", "Wo"};
+    int inputs[kGqaMatrices] = {wq_rows, wk_rows, wv_rows, wo_rows};
+    int outputs[kGqaMatrices] = {wq_cols, wk_cols, wv_cols, wo_cols};
+    const int matrix_count = have_wo ? kGqaMatrices : 3;
     GqaLayer replacement = {};
+
     /* Validate every packed size before any allocation or host read. Q8_0 is
      * output_count * (input_width / 32) * 34 bytes, never rows * cols bytes. */
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < matrix_count; ++i) {
         GqaMatrix& m = replacement.matrix[i];
         size_t input_bytes, output_bytes;
-        m.input_dim = wq_rows;
+        m.input_dim = inputs[i];
         m.output_dim = outputs[i];
         if (checked_q8_sizes(m.output_dim, m.input_dim, &m.bytes,
                              &input_bytes, &output_bytes) != 0) {
-            fprintf(stderr, "LinMoE HIP: invalid packed size layer=%d matrix=%s\n", layer, names[i]);
+            fprintf(stderr,
+                    "LinMoE HIP: invalid packed size layer=%d matrix=%s input=%d output=%d\n",
+                    layer, names[i], m.input_dim, m.output_dim);
             return -1;
         }
     }
-    for (int i = 0; i < 3; ++i) {
+
+    for (int i = 0; i < matrix_count; ++i) {
         GqaMatrix& m = replacement.matrix[i];
         char context[160];
         gqa_context(context, sizeof(context), "hipMalloc/upload", layer, names[i],
@@ -750,35 +780,57 @@ extern "C" int gpu_upload_gqa_weights(int layer,
         int allocated;
         if (g_gqa_fail_alloc_after == 0) {
             g_gqa_fail_alloc_after = -1;
-            allocated = report_hip_error(context, hipErrorOutOfMemory, m.bytes, g_hip.device);
+            allocated = report_hip_error(context, hipErrorOutOfMemory,
+                                         m.bytes, g_hip.device);
         } else {
             allocated = hip_alloc_tracked((void**)&m.data, m.bytes, context);
-            if (allocated == 0 && g_gqa_fail_alloc_after > 0) --g_gqa_fail_alloc_after;
+            if (allocated == 0 && g_gqa_fail_alloc_after > 0)
+                --g_gqa_fail_alloc_after;
         }
         if (allocated != 0) {
-            /* Ordinary OOM is recoverable: drain earlier copies, discard only
-             * the replacement, and leave the previously uploaded layer usable. */
-            if (sync_stream_checked(g_hip.compute, context) != 0) gqa_failed(context);
+            /* OOM during any matrix, including Wo, is recoverable. Drain prior
+             * replacement copies, discard only the replacement, and preserve
+             * the complete previously resident layer. */
+            if (sync_stream_checked(g_hip.compute, context) != 0)
+                gqa_failed(context);
+            free_gqa_layer(replacement, layer);
+            return -1;
+        }
+
+        /* Test-only copy failure is injected before this matrix is enqueued, so
+         * rollback can verify old Q/K/V/Wo residency without poisoning HIP.
+         * Real HIP copy errors still fault the GQA stream below. */
+        if (g_gqa_fail_copy_after == 0) {
+            g_gqa_fail_copy_after = -1;
+            report_hip_error(context, hipErrorInvalidValue, m.bytes, g_hip.device);
+            if (sync_stream_checked(g_hip.compute, context) != 0)
+                gqa_failed(context);
             free_gqa_layer(replacement, layer);
             return -1;
         }
         if (copy_async_checked(m.data, host[i], m.bytes, hipMemcpyHostToDevice,
-                                g_hip.compute, context) != 0) {
+                               g_hip.compute, context) != 0) {
             gqa_failed(context);
             free_gqa_layer(replacement, layer);
             return -1;
         }
+        if (g_gqa_fail_copy_after > 0) --g_gqa_fail_copy_after;
     }
+
     char context[160];
     gqa_context(context, sizeof(context), "hipStreamSynchronize(upload)", layer,
-                "Wq/Wk/Wv", wq_rows, wq_cols);
+                have_wo ? "Wq/Wk/Wv/Wo" : "Wq/Wk/Wv", wq_rows, wq_cols);
     if (sync_stream_checked(g_hip.compute, context) != 0) {
         gqa_failed(context);
         free_gqa_layer(replacement, layer);
         return -1;
     }
+
+    /* Commit only after the complete requested replacement is resident. A
+     * Q/K/V-only replacement intentionally removes any older Wo allocation. */
     free_gqa_layer(g_gqa[layer], layer);
     replacement.loaded = true;
+    replacement.wo_loaded = have_wo;
     g_gqa[layer] = replacement;
     return 0;
 }
@@ -844,8 +896,69 @@ extern "C" int gpu_gqa_projections(int layer,
 extern "C" int gpu_gqa_output(int layer,
     const float* attn_out, int attn_dim,
     float* output, int hidden_dim) {
-    (void)layer; (void)attn_out; (void)attn_dim; (void)output; (void)hidden_dim;
-    return foundation_unavailable(__func__);
+    if (!g_hip.initialized || g_gqa_faulted || layer < 0 || layer >= kGqaLayers ||
+        !attn_out || !output || !g_gqa[layer].loaded || !g_gqa[layer].wo_loaded) {
+        fprintf(stderr,
+                "LinMoE HIP: invalid GQA Wo state/buffers layer=%d input=%d output=%d\n",
+                layer, attn_dim, hidden_dim);
+        return -1;
+    }
+
+    GqaMatrix& wo = g_gqa[layer].matrix[3];
+    if (attn_dim != wo.input_dim || hidden_dim != wo.output_dim) {
+        fprintf(stderr,
+                "LinMoE HIP: GQA Wo shape mismatch layer=%d input=%d/%d output=%d/%d\n",
+                layer, attn_dim, wo.input_dim, hidden_dim, wo.output_dim);
+        return -1;
+    }
+
+    size_t weight_bytes = 0, input_bytes = 0, output_bytes = 0;
+    if (checked_q8_sizes(hidden_dim, attn_dim, &weight_bytes,
+                         &input_bytes, &output_bytes) != 0 ||
+        input_bytes > SIZE_MAX - output_bytes) {
+        fprintf(stderr,
+                "LinMoE HIP: invalid GQA Wo scratch size layer=%d input=%d output=%d\n",
+                layer, attn_dim, hidden_dim);
+        return -1;
+    }
+    size_t total = input_bytes + output_bytes;
+    char context[160];
+    gqa_context(context, sizeof(context), "hipMalloc(scratch)", layer,
+                "Wo", attn_dim, hidden_dim);
+    if (reserve_gqa_scratch(total, context) != 0) return -1;
+
+    float* device_input = (float*)g_gqa_scratch;
+    float* device_output = device_input + attn_dim;
+
+    /* The existing compute stream serializes H2D -> validated Q8 kernel -> D2H.
+     * Host attention has already completed before entry, and output is copied
+     * to the caller only after stream synchronization succeeds. */
+    gqa_context(context, sizeof(context), "hipMemcpyAsync(input H2D)", layer,
+                "Wo", attn_dim, hidden_dim);
+    if (copy_async_checked(device_input, attn_out, input_bytes,
+                           hipMemcpyHostToDevice, g_hip.compute, context) != 0)
+        return gqa_failed(context);
+
+    gqa_context(context, sizeof(context), "kernel launch", layer,
+                "Wo", attn_dim, hidden_dim);
+    if (launch_q8(device_output, wo.data, device_input, hidden_dim, attn_dim,
+                  LM_HIP_Q8_SIMPLE, context) != 0)
+        return gqa_failed(context);
+
+    gqa_context(context, sizeof(context), "hipMemcpyAsync(D2H)", layer,
+                "Wo", attn_dim, hidden_dim);
+    if (copy_async_checked(g_gqa_host, device_output, output_bytes,
+                           hipMemcpyDeviceToHost, g_hip.compute, context) != 0)
+        return gqa_failed(context);
+
+    gqa_context(context, sizeof(context), "hipStreamSynchronize(output)", layer,
+                "Wo", attn_dim, hidden_dim);
+    if (sync_stream_checked(g_hip.compute, context) != 0)
+        return gqa_failed(context);
+
+    /* Never publish stale/partial host data after a failed device operation. */
+    memcpy(output, g_gqa_host, output_bytes);
+    return 0;
 }
 
 extern "C" int gpu_upload_router(int layer, const float* weights,

@@ -856,7 +856,7 @@ int main(int argc, char** argv) {
     unsigned char* gqa_uploaded = (unsigned char*)calloc((size_t)cfg.num_layers, 1);
     if (!gqa_uploaded) { gpu_shutdown(); exit(EXIT_FAILURE); }
     if (gpu_runtime_initialized && !use_gpu)
-        fprintf(stderr, "Staged GPU backend: GQA Q/K/V=%s; attention, Wo, DeltaNet and experts stay on CPU\n",
+        fprintf(stderr, "Staged GPU backend: GQA Q/K/V/Wo=%s; attention, DeltaNet and experts stay on CPU\n",
                 use_gqa_gpu ? "enabled" : "disabled (opt in with WINMOE_GQA_HIP=1)");
     if (use_gpu) {
         /* Configure GPU expert cache limit (default 200, env-overridable) */
@@ -948,17 +948,28 @@ int main(int argc, char** argv) {
         for (i = 0; i < cfg.num_layers; ++i) {
             LayerWeights* lw = &layers[i];
             if (lw->is_deltanet) continue;
-            const char* names[] = {"attn_q.weight", "attn_k.weight", "attn_v.weight"};
-            int outputs[] = {lw->wq_rows, lw->wk_rows, lw->wk_rows};
-            for (int m = 0; m < 3; ++m) {
+            /* Q/K/V consume hidden state; Wo consumes the ungated attention
+             * width (Q+gate/2) and returns hidden width. Validate the actual
+             * GGUF tensor layout before any HIP upload so device residency has
+             * the same dimensions used by the CPU attention boundary. */
+            const char* names[] = {
+                "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight"
+            };
+            int inputs[] = {H, H, H, lw->wq_rows / 2};
+            int outputs[] = {lw->wq_rows, lw->wk_rows, lw->wk_rows, H};
+            for (int m = 0; m < 4; ++m) {
                 char name[128];
                 snprintf(name, sizeof(name), "blk.%d.%s", i, names[m]);
                 TensorInfo* tensor = find_tensor(&model, name);
-                if (!tensor || tensor->n_dims != 2 || tensor->type != 8 || H % 32 ||
-                    tensor->dims[0] != (uint64_t)H || tensor->dims[1] != (uint64_t)outputs[m] ||
-                    tensor->data_size != (uint64_t)outputs[m] * (H / 32) * 34) {
-                    fprintf(stderr, "LinMoE: GQA GPU requires matching Q8_0 tensor %s input=%d output=%d\n",
-                            name, H, outputs[m]);
+                if (!tensor || tensor->n_dims != 2 || tensor->type != 8 ||
+                    inputs[m] <= 0 || inputs[m] % 32 ||
+                    tensor->dims[0] != (uint64_t)inputs[m] ||
+                    tensor->dims[1] != (uint64_t)outputs[m] ||
+                    tensor->data_size != (uint64_t)outputs[m] *
+                                         ((uint64_t)inputs[m] / 32) * 34) {
+                    fprintf(stderr,
+                            "LinMoE: GQA GPU requires matching Q8_0 tensor %s input=%d output=%d\n",
+                            name, inputs[m], outputs[m]);
                     gpu_shutdown(); exit(EXIT_FAILURE);
                 }
             }
@@ -971,7 +982,8 @@ int main(int argc, char** argv) {
             gqa_uploaded[i] = 1;
             ++count;
         }
-        fprintf(stderr, "GPU GQA Q/K/V: %d layers uploaded, VRAM=%.6f MiB\n", count, gpu_vram_used_mb());
+        fprintf(stderr, "GPU GQA Q/K/V/Wo: %d layers uploaded, VRAM=%.6f MiB\n",
+                count, gpu_vram_used_mb());
     }
 
     fprintf(stderr, "DeltaNet states: %d layers, KV caches: %d layers\n",
@@ -1668,9 +1680,24 @@ int main(int argc, char** argv) {
                         }
                     }
 
-                    /* 8. O projection: [attn_dim → hidden_dim] — GPU if available */
-                    if (!use_gpu || force_cpu_gqa || gpu_gqa_output(layer, attn_buf, attn_dim, o_out, H) != 0)
+                    /* 8. O projection: [attn_dim → hidden_dim]. A layer whose
+                     * Q/K/V weights were uploaded also owns Wo, so a HIP failure
+                     * is fatal rather than silently consuming a CPU fallback. */
+                    if (gqa_uploaded[layer]) {
+                        if (gpu_gqa_output(layer, attn_buf, attn_dim, o_out, H) != 0) {
+                            fprintf(stderr,
+                                    "LinMoE: GQA GPU Wo projection failed layer=%d token=%d\n",
+                                    layer, tok);
+                            gpu_shutdown(); exit(EXIT_FAILURE);
+                        }
+                    } else if (gqa_fp32_reference && lw->wo_type == 8) {
+                        /* Test-only scalar FP32-input oracle keeps the hybrid
+                         * comparison focused on HIP reduction error instead of
+                         * the normal CPU Q8_K activation quantization path. */
+                        gqa_reference_matvec(o_out, lw->wo, attn_buf, H, attn_dim);
+                    } else {
                         quant_matvec(o_out, lw->wo, attn_buf, H, attn_dim, lw->wo_type);
+                    }
 
                     if (tok == 0 && layer == 3) {
                         float orms = 0; for (i = 0; i < H; i++) orms += o_out[i]*o_out[i];

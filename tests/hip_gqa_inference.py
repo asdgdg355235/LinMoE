@@ -1,7 +1,7 @@
-"""Nonzero synthetic inference: identical CPU attention, only Q/K/V changes.
+"""Nonzero synthetic inference: CPU attention with HIP Q/K/V/Wo projections.
 
-Run after standalone Q8 and GQA parity. Compare every emitted logit and GQA
-trace summaries; the dedicated GQA fixture already checks every projection row.
+Run after standalone Q8, GQA Q/K/V and Wo parity. Compare every emitted logit
+and GQA trace summary; dedicated fixtures already check every projection row.
 The optional --cpu-only mode validates the fixture/oracle locally without HIP.
 """
 import math
@@ -39,8 +39,8 @@ with tempfile.TemporaryDirectory(prefix='linmoe-gqa-inference-') as tmp:
                                  capture_output=True, text=True, timeout=60)
             assert run.returncode == 0, (run.returncode, run.stderr)
             if mode == 'candidate' and not cpu_only:
-                assert 'GPU GQA Q/K/V: 1 layers uploaded' in run.stderr, run.stderr
-                assert 'GQA Q/K/V=enabled' in run.stderr, run.stderr
+                assert 'GPU GQA Q/K/V/Wo: 1 layers uploaded' in run.stderr, run.stderr
+                assert 'GQA Q/K/V/Wo=enabled' in run.stderr, run.stderr
             assert f'Trace target: tok={position}' in run.stderr, run.stderr
             data = logits_path.read_bytes()
             assert len(data) == 3 * 32 * 4
@@ -68,6 +68,6 @@ with tempfile.TemporaryDirectory(prefix='linmoe-gqa-inference-') as tmp:
         for key in traces[position]:
             for actual, expected in zip(traces[3+position][key], traces[position][key]):
                 assert math.isfinite(actual) and abs(actual-expected) <= 1e-3 + 5e-5*abs(expected), (position, key, actual, expected)
-    label = 'CPU fixture self-check' if cpu_only else 'HIP Q/K/V + CPU attention parity'
+    label = 'CPU fixture self-check' if cpu_only else 'HIP Q/K/V/Wo + CPU attention parity'
     print(f'{label} PASS: 3 positions, nonzero GQA, max_abs_diff={max(errors):.9g}, '
           f'RMSE={math.sqrt(sum(x*x for x in errors)/len(errors)):.9g}')
