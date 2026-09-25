@@ -18,6 +18,11 @@ int gpu_is_initialized(void) {
     return 0;
 }
 
+/* CPU has no accelerator implementation behind the high-level GPU API. */
+int gpu_supports_full_inference(void) {
+    return 0;
+}
+
 float gpu_vram_used_mb(void) {
     return 0.0f;
 }
