@@ -797,6 +797,8 @@ extern "C" int gpu_upload_gqa_weights(int layer,
             return -1;
         }
 
+        gqa_context(context, sizeof(context), "hipMemcpyAsync(upload H2D)",
+                    layer, names[i], m.input_dim, m.output_dim);
         /* Test-only copy failure is injected before this matrix is enqueued, so
          * rollback can verify old Q/K/V/Wo residency without poisoning HIP.
          * Real HIP copy errors still fault the GQA stream below. */
